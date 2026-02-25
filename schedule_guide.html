@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="TD_simple.ico" type="image/x-icon">
+<title>Schedule — Route, Timings and Controls (Guide)</title>
+<style>
+/* TD Rally Guide Base (stable, GitHub/local consistent) */
+:root{
+  --td-blue:#0070C0;
+  --td-text:#111;
+  --td-muted:#444;
+}
+html,body{margin:0;padding:0;background:#fff;color:var(--td-text);}
+body{
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  font-size:14px;
+  line-height:1.55;
+}
+main{
+  max-width: 980px;
+  margin: 36px auto;
+  padding: 0 24px 40px;
+}
+h1{
+  font-size:26px;
+  line-height:1.2;
+  margin: 0 0 14px;
+  color: var(--td-blue);
+  font-weight: 700;
+}
+h2{
+  font-size:18px;
+  line-height:1.25;
+  margin: 22px 0 10px;
+  color: var(--td-blue);
+  font-weight: 700;
+}
+h3{
+  font-size:14px;
+  line-height:1.25;
+  margin: 14px 0 6px;
+  color: var(--td-text);
+  font-weight: 600;
+}
+p{margin: 0 0 10px;}
+ul{margin: 0 0 10px 22px; padding:0;}
+li{margin: 0 0 6px;}
+.note{
+  color: var(--td-muted);
+  margin-top: 2px;
+}
+hr{
+  border:0;
+  border-top:1px solid #e5e7eb;
+  margin: 18px 0;
+}
+</style>
+</head>
+<body>
+<main>
+<h1>Schedule — Route, Timings and Controls</h1>
+<h2>Overview</h2>
+<p>The Schedule page is used to build the rally route and calculate timings. You add rows of instructions and controls as required, you set distance and speed for each row of the schedule. As controls are added to the schedule, they are automatically added to the controls page based on the selected rally day.</p>
+<p>The page has a Normal/Compact button, toggling the button changes the page size.</p>
+<h2>Key steps</h2>
+<ul>
+<li>Build the route using instruction and control rows.</li>
+<li>Define distances and speeds, times are calculated automatically.</li>
+<li>Control what is to be printed, using tick boxes and colour rules, red is not printed.</li>
+<li>Manage Speed Groups (SG) by comparing side by side.</li>
+<li>Add and manage Added Time adjustments, examples, traffic lights, tea and lunch stops.</li>
+<li>Save, Load, Rally projects.</li>
+<li>Print schedule outputs based on day and speed group.</li>
+</ul>
+<h2>Rows</h2>
+<h2>Row types:</h2>
+<ul>
+<li>Instruction — normal route instruction.</li>
+<li>STC — Self Time Control.</li>
+<li>Marshal — marshal control point.</li>
+<li>Open Control — a control with rules.</li>
+<li>Added Time — applies a time delay adjustment, per speed group.</li>
+<li>Start STC — resets the timing baseline.</li>
+</ul>
+<h2>Font colour and print protocol</h2>
+<p>To clearly indicate editability and that printed.
+
+Colour rules:</p>
+<ul>
+<li>Blue text — auto-calculated and none editable.</li>
+<li>Red text — will not appear in print.</li>
+<li>Black text — normal editable and printed content.</li>
+</ul>
+<h2>Notes:</h2>
+<ul>
+<li>Red text is automatically excluded from a print output.</li>
+<li>Colour feedback updates immediately as options change.</li>
+</ul>
+<h3>Tick boxes for printing options</h3>
+<p>To control whether specific values appear in a printed output.
+
+How it works:</p>
+<ul>
+<li>DIST and TIME fields include a tick box.</li>
+<li>When ticked, the value turns red and not printed.</li>
+<li>Note: Some row types automatically suppress details from print.</li>
+</ul>
+<h3>Pristine state (orange warning)</h3>
+<p>Indicates values that have not yet been edited or confirmed.
+
+How it works:</p>
+<ul>
+<li>Newly added row the DIST and SPEED values present an orange ring.</li>
+<li>The ring clears once the value is edited or confirmed.</li>
+<li>Pristine is a visual warning only.</li>
+<li>It does not affect calculations or printing.</li>
+</ul>
+<h2>Distance validation</h2>
+<p>Warning of an invalid distance sequence.</p>
+<ul>
+<li>If a distance goes backwards, the field is flagged by a red border.</li>
+<li>This highlights a route distance error.</li>
+</ul>
+<p class='note'>Note: Calculations continue, but the error should be corrected before use.</p>
+<h2>Speed validation (print clarity)</h2>
+<p>Speeds are only printed in a following row when there is value change, this is applied automatically.</p>
+<h2>Gear icon in the first coloumb</h2>
+<p>When selected a menu is present offering a number of insertion options, an insert is placed in the row below that first selected, there is also a delete option.</p>
+<h2>Turn column and print selection</h2>
+<p>Turn instructions can optionally appear in the printed output. For those that prefer to write turnings as part of an instruction text, the Turn column can be switch off.</p>
+<ul>
+<li>The TURN column has a global print toggle, click “Turn” in the column header it will turn red</li>
+<li>When disabled, the TURN column is hidden from print</li>
+<li>Visual feedback shows the column details in red, they will not be printed.</li>
+</ul>
+<h2>Speed Group (SG) Cards</h2>
+<p>To show timing and speed information per speed group.</p>
+<p>In the button panel above the main table is a listing of the 4 SGs and the maximum speeds of that group. If a group has been allocated (Admin) then the group will include a selection tick box, when selected that SG card will be presented in the schedule table. The cards can be freely selected and deselected, data entered into them being retained when closed.
+
+How it works:</p>
+<ul>
+<li>SG cards appear within the Instruction column when selected in the control panel.</li>
+<li>Each lane shows time and speed for that group.</li>
+<li>SG are only provided when setup in the Admin page.</li>
+</ul>
+<h2>Added Time row</h2>
+<p>An added row enables the introduction of added time to the next instruction, times added are SG independent. On screen an added time row is taller but in print its row height is the same as any other row.</p>
+<p>Added times are added to compensate for delays at traffic lights and time provided for breaks in the schedule, such as lunch.</p>
+<p>Added times can be applied to each SG individually.</p>
+<p>Optionally the added time row can be selected not to print, "NO PRINT", in which case you can use an instruction row above, its dist being set to the same as that of the added time row, then write your own details. The added row timings will still be applied to the row below it.</p>
+<h2>Use case</h2>
+<p>Such timings can be used to give slower speed groups a head start to avoid faster groups needing to overtake in a section where it might be difficult to do so.</p>
+<p>Tip: Use Timeline to aid appreciation of groups as they proceed along the route.</p>
+<h2>Save and Load</h2>
+<p>Save and load are common to all pages, selecting save will store a backup of your work in the workspace folder based on the rally title.</p>
+<p>Load when selected will present a file picker to enable the selection of which saved rally file is to be loaded, it must be emphasized that loading will overwrite your current work.
+
+Note: a warning is shown before loading a file.</p>
+<h2>Day selection</h2>
+<p>Purpose:
+To select which rally day is being viewed and edited in schedule, when you select an alternate day the Controls page for that day will be automatically selected, likewise the same applies selecting a day in Controls, the schedule for that day will be presented. On a rally day the pages for that day are automatically selected on opening the program.</p>
+<h2>How to use:</h2>
+<ul>
+<li>Use the Day selector at the top of the page.</li>
+<li>Select the required day.</li>
+<li>The visible cards and data update immediately.</li>
+</ul>
+<h2>Print options</h2>
+<p>When print is selected options are presented, select the day to be printed and for which speed group. The print dialog offering options for portrait or landscape formats. The layout of the printed pages is predefined.
+
+Note: Red (non-printing) values are omitted automatically</p>
+<h2>Timeline</h2>
+<p>A tool that can be used to review cars and the different speed groups as they proceed along the rally route and review where faster groups pass slower ones.</p>
+<p>When the timeline card is opened there are option buttons to select how it is presented on the page.</p>
+<ul>
+<li>Dock, the card is positioned in the table on the right, the edge of the card can be moved left and right as required.</li>
+<li>Float, the card can be freely positioned on the page.</li>
+<li>Normal/Compact, change the size of the card.</li>
+</ul>
+<h2>Card controls</h2>
+<h2>Start delays section:</h2>
+<p>Group identifies each of the assigned SG and the entries for that (group).</p>
+<p>Delays (min): At the start of the rally added delays between SG can be applied, giving slower groups a head start to avoid faster groups having to overtake when road condition are less than ideal. Use the “Apply live delays” selector to turn delays on and off.</p>
+<p>Cars: when planning and reviewing the rally using Timeline entries for each SG may not be known, so cars are manually selected as a representation of the rally Cars for each group.</p>
+<p class='note'>Note: In the graphic each SG is illustrated as a train of cars, the dots in the train being the distance between cars, these spacings change dynamically based on speed.</p>
+</ul>
+<h2>Focus Row</h2>
+<p>Enables the selection of an instruction/waypoint in the schedule and sets the centre point of the graphic to that point. Listed below is copy of the table instruction text for that waypoint.</p>
+
+<h2>TimeLine graphic</h2>
+<p>Below the graphic are two horizontal scroll bars, the upper one pans the length of the routes whilst the lower one pans 20 minutes either side of the current focused point, when a focus point is changed the time scroll resets to centre. At the bottom of the graphic pane are left and right arrows icons that enable stepping forward and backward along the route.</p>
+<p>Waypoints such as STC, Marshal and Added time are colour coded for ease of reference. To the right of a waypoint in front of each train approaching that waypoint are times, A for arrival and associated with an Added time waypoint a D for departure time. Times are Rally master time.</p>
+<h2>Interaction with Admin and Controls – Start delays</h2>
+<p>If start delay times are to be taken into account, then in Admin when the staring order is slowest groups first an additional option is present in the Control panel to add delay times to the start times of the groups, including delay timings automatically updates the control page ETA timings.</p>
+</main>
+</body>
+</html>

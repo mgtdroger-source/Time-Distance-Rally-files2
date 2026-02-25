@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="TD_simple.ico" type="image/x-icon">
+<title>Time and Distance Rallies Overview (Guide)</title>
+<style>
+/* TD Rally Guide Base (stable, GitHub/local consistent) */
+:root{
+  --td-blue:#0070C0;
+  --td-text:#111;
+  --td-muted:#444;
+}
+html,body{margin:0;padding:0;background:#fff;color:var(--td-text);}
+body{
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  font-size:14px;
+  line-height:1.55;
+}
+main{
+  max-width: 980px;
+  margin: 36px auto;
+  padding: 0 24px 40px;
+}
+h1{
+  font-size:26px;
+  line-height:1.2;
+  margin: 0 0 14px;
+  color: var(--td-blue);
+  font-weight: 700;
+}
+h2{
+  font-size:18px;
+  line-height:1.25;
+  margin: 22px 0 10px;
+  color: var(--td-blue);
+  font-weight: 700;
+}
+h3{
+  font-size:14px;
+  line-height:1.25;
+  margin: 14px 0 6px;
+  color: var(--td-text);
+  font-weight: 600;
+}
+p{margin: 0 0 10px;}
+ul{margin: 0 0 10px 22px; padding:0;}
+li{margin: 0 0 6px;}
+.note{
+  color: var(--td-muted);
+  margin-top: 2px;
+}
+hr{
+  border:0;
+  border-top:1px solid #e5e7eb;
+  margin: 18px 0;
+}
+</style>
+</head>
+<body>
+<main>
+<h1>Time and Distance Rallies Overview</h1>
+<h2>Introduction</h2>
+<p>Time and Distance Rallies is a highly automated program for up to 7 days and up to 4 speed groups. The program eliminates much of the time and effort that is associated with more manual rally tools. Firstly entries can be gained and the entry data populated automatically utilizing Google forms, you need only setup Google once, thereafter your current and future rallies will be managed, the Google forms are generated for you so there little to no need for you to interact with Google other than initial setting up. The same automation applies to result gathering, Self Time Controls and Marshal timings are gained using Google forms, again fully automated. At an appropriate time just before or on the Rally Day all that is required is for you to upload the preconfigured Controls data, then share the Google form links to the competitors and Marshals, using email or WhatsApp. Later once responses have been returned, download the data to the Controls page and print the result once you have given them a review. No manual entries required.</p>
+<h2>Initial setting up</h2>
+<p>The Admin page is used to setup two key support facilities, firstly a folder on your machine to save your rally projects, once that projects folder is defined all your rally projects will be saved there, as each new project is saved a sub folder will be created for you and as each project is saved a new version number appended.</p>
+<p>The second facility to be setup is that of Google World, this entails you interacting with Google Drive and copying one file into it, then publishing that file, at the end of the process a URL (an address) will be presented which you copy into the Enries card of the Admin page.</p>
+<p>From then on you are fully automated. As you use the program your work is fully recorded, so saving to your Rallies folder is more about having a backup than the need for constant saving in case your project is interrupted.</p>
+<p>Google only needs to be interacted with for the initial setup; once completed, all entry and control forms are created automatically and tailored to the details of each Rally. Within the Admin and Controls pages there are cards the provide interface to the Google forms enabling you to check responses before downloading into the program, all this without you having to navigate the Google Drive, it’s done for you.</p>
+<p>Each page has a Normal / Compact button, Compact mode for viewing pages on a smaller screen.</p>
+<h2>Separate documents providing more information</h2>
+<ul>
+<li>Admin guide</li>
+<li>Setting up guide (Google - Admin Entries Card)</li>
+<li>Schedule guide</li>
+<li>Controls guide</li>
+
+</ul>
+
+<h2>Admin page</h2>
+<p>Your project commences on the admin page, selecting the number of rally days and dates, the starting times and the increment of time of each car starting, per day. Separate start delays between speed groups can be added when required.</p>
+<p>Next is the selection of the number of speed groups you intend to offer and the maximum speeds for each group. These maximum speeds regulate the speeds that can be set when setting speeds - schedule page.</p>
+<p>Next is to give your rally a title, initially you will observe an orange ring around the title entry pill, this indicates that an entry is required, you will encounter the same orange rings on the schedule page ensuring you have committed the required information. Once the Title has been entered the orange ring is removed and all other pages updated with the title. Committing the title initiates your working records and defines the name of the folder for when you formally save. The tools menu of the admin page supports a number of save options as well as starting a new rally project. Once all entries have been entered or gathered the next task is to Sort the entries into speed groups, this done using the sort function, fastest or slowest groups first. But once your entries are in sorted state options such as adding, inserting rows as well as downloading further entries is inhibited, if more entries are to be added then the table must be un-sorted first.</p>
+<h2>Schedule page</h2>
+<p>The schedule page is used to build your rally routes, for each row of the page you define the distance, the speed for that speed group and the instruction text. Optionally there is the Turn column and its menu to select a turn abbreviation, if you prefer to write such details in your instructions then the turn column can be hidden from print by clicking the Turn header which will turn Red, as a convention any font displayed Red is not printed, this applies to all details including distances, times and speeds.</p>
+<p>The Add Row button when selected presents a menu of pre configured row types, for example Self Timed Controls (STC) or Marshal, each row type differs in what needs to be configured and what will be printed. A marshal row is tinted Red, it’s never printed.</p>
+<p>Distance and Time entries have an options tick box, when checked the detail turns Red, so not printed. Each distance and speed must be edited, as indicated by the orange ring. If when entering a distance and that distance is less than row prior the error will be highlighted by a red border.</p>
+<p>Speed Groups, these can be viewed side by side, the available groups are shown in the button panel above the table area. Groups are assigned to the schedule page by admin, if a selector is provided checking it will result in the display of that group on the page. When a speed group card is again removed its data is retained.</p>
+<p>Added time is a row type that enables the inclusion of additional time to the next instruction, timings for traffic light, fuel stops and lunch breaks. A drop-down selection menu is provided or you can write your own words in the instruction text. A key use of added time is to set different times for break periods such as lunch, so that after lunch slower speed groups are given time to get ahead especially if there is a known section of the route where overtaking maybe restricted. Note: Added time can be applied per speed group, yet they share a common instruction text, so consider your wording carefully, for instance, added time has been included to the next instruction, or add a row below at the same distance, with an instruction - leaving time after the break interval.</p>
+<p>Start STC, this row type is used when you are going to provide an untimed gap in the schedule. At the Start STC competitors record their rally master time when they depart the Start STC location, route schedule timings are reset commencing from the Start STC, if there is to be a Marshal after a Start STC then there must be a clear understanding that the timing of cars passing that marshal will not be defined. The controls section of the program accounts for Start STC’s automatically.</p>
+<p>Timeline is a tool that enables you to survey the rally route and review where along the route different speed groups come together. As you step through each waypoint of the route times are shown as well as the speeds of the groups approaching that waypoint. At an Added Time waypoint both A, arrival time and D, departure times are presented.</p>
+<p>Each group of cars is represented as a train, the dots in the train separated by the distance between the cars of the group.</p>
+<p>During your planning process all your entries and their speed group preferences will not be know, the Timeline card indicates Group (X) the X indicating actual entries to date, the trains of timeline are driven by cars, the number of which you select manually. Lastly there is delay, this setting enables the delaying of groups from the start, but the delays that you set in timeline will only be applied to the rally starting times when so selected in the admin page, start delays are only available for selection when the starting order is slowest groups first.</p>
+<h2>Controls page</h2>
+<p>The controls page is automatically populated with entrant details and control cards as they are added to the route schedule. If the page is to be used manually then only ATA times need to be entered, to aid manual entries selecting the entrant rally number will present a card listing all the controls so ATA data can be recorded more efficiently.</p>
+<p>Optionally there is a Clerk of the Course (COC) card into which can be entered a reason for receiving additional penalties and the value to be awarded, by default COC penalty are not included in the final score until COC is checked.</p>
+<p>Once all the ATA timings have been entered, either manually or via download, each of the control cards can be reviewed, to aid the process there is the audit option, when selected score value higher than the audit value will be highlighted in Red, if it is considered that scores for that control are above expectation, potential as a result of an unforeseen delay then that control can be unchecked excluding its error scores from the days total score, when printed that control will be shown as 0 errors.</p>
+<p>Should you wish to review ETA time based on start times the Starts button can be selected, which temporarily replaces total score with start timings.</p> 
+<p>On the controls page to the left of the Controls data button is the Plan OK/Plan changed indicator, if your controls page data is changed, an added control, or an added entrant, after you have already uploaded, then the indicator will wink advising that your uploaded data is out of date.</p> 
+<p>Printing of results, once you have checked and are satisfied that the results are ready for presentation the print button is selected, select the desired option and print. The result page can be exported in Excel format.</p>
+
+<h2>Google World overview</h2>
+<p>The rally application automatically configures a Google drive with the assets required to manage rally projects. A master folder in your My Drive titled Time &amp; Distance Rallies is created, for each new rally is a new folder is added inside this main folder.</p>
+<p>Google forms are that which you share inviting entries and during the rally gaining result data for STC and Marshal times. These forms are generated automatically based on the details of the specific rally.</p>
+<p>As data is submitted it populates a Google response sheet, these sheets are surveyed and responses checked before being transferred to a rally project worksheet, this all happens automatically.</p>
+<h3>Entry form</h3>
+<p>The default title of the entry form is the same as the rally name first entered, but it can be edited in the Admin entries card as required, once you have performed an upload the link to the form can be selected and the form reviewed, if necessary, you can amend the form title text and then re-upload before distributing the link to the form for entrants to complete.</p>
+<p>Speed Group options included in the form are as setup on Admin page. After publication, the speed of a group might be amended during the subsequent rally design process, if a speed value of a group is changed, no matter what value was published on the form that entrant will still be assigned to the group selected. There is no need to republish the entry form.</p>
+<p>An entrant can submit more than one response, should a later response be received that copied to the worksheet will be overwritten, the details qualifying an entry are drivers surname and email address. Recorded in the Google response will be all the entries but the worksheet will only have the last entry for that entrant, where this is useful, a change of navigator for example.</p>
+<h3>STC form</h3>
+<p>The STC form is automatically complements the STC controls included in the rally schedule. An entrant can return more than one response, the last being presented in the data worksheet. STC response are qualified based on drivers surname and rally number, any response that does not match this check criteria is copied to an STC Error sheet which can be reviewed via the Open controls data button provided on Controls data card.</p>
+<h3>Marshal forms</h3>
+<p>There is only one marshal form per rally day, each form list all the entrants as well as detailing each marshal by number/location.</p> 
+<p>Included on the form are the ETA times for the first and last car to pass each marshal location, these times do not include how long before or after the ETA times the marshal should be at the location, typically 10 minutes.</p>
+<h3>Populating the rally pages</h3>
+<p>In order to populates the pages of the program, Entries or Controls, the interface cards of that page are selected, worksheet data can be reviewed using the buttons of the card, then Download selected, pages are populated automatically.</p>
+<p>Uploading and downloading is not and instantaneous process, so allow time for the program to do its job.</p>
+</main>
+</body>
+</html>
