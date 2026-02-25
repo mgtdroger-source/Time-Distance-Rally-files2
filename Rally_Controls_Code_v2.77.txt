@@ -1,0 +1,3054 @@
+/**
+ * Rally Controls – Code.gs v2.77
+ *
+ * Responsibilities:
+ * - Maintain a single "Time & Distance Rallies" root folder in Drive
+ * - For each rally name, maintain a "Rally – <name>" folder
+ * - Inside that folder, keep a "Rally Controls – <name>" spreadsheet
+ *   with:
+ *      * ControlsConfig
+ *      * Errors
+ * - Provide Web App JSON API:
+ *      * mode=ping
+ *      * mode=initForms
+ *      * mode=uploadControls
+ *
+ * Notes:
+ * - Google Forms creates response tabs asynchronously after (re)linking a destination.
+ *   To keep response spreadsheets tidy without Drive trash, this script uses a
+ *   two-phase cleanup: queue during upload, then prune/rename ~60s later.
+ */
+
+const RC_VERSION = 'v2.77';
+
+
+// Some earlier bakes used hyphen-minus " - " instead of en dash " – " in Drive
+// object names. Status lookups must tolerate both without creating duplicates.
+
+function nameVariants_(s) {
+  // Return a small set of likely name variants (no exhaustive normalization).
+  if (!s) return [''];
+  var out = {};
+  function add_(v) { if (v != null && v !== '') out[String(v)] = true; }
+
+  add_(s);
+  // Swap spaced separators.
+  add_(String(s).split(' – ').join(' - '));
+  add_(String(s).split(' - ').join(' – '));
+  // Swap raw characters too, in case names were built without spaces.
+  add_(String(s).split('–').join('-'));
+  add_(String(s).split('-').join('–'));
+
+  return Object.keys(out);
+}
+
+function firstFileByNameVariants_(folder, names) {
+  if (!folder) return null;
+  for (var i = 0; i < names.length; i++) {
+    try {
+      var it = folder.getFilesByName(names[i]);
+      if (it.hasNext()) return it.next();
+    } catch (e) {}
+  }
+  return null;
+}
+
+
+
+function moveFileToFolder_(file, folder) {
+  if (!file || !folder) return;
+  try {
+    var folderId = folder.getId && folder.getId();
+
+    // Helper: check if file currently has folder as a parent.
+    function hasParent_() {
+      try {
+        var parents = file.getParents();
+        while (parents.hasNext()) {
+          var p = parents.next();
+          if (p && p.getId && p.getId() === folderId) return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
+    // 1) Add to target folder if needed.
+    if (!hasParent_()) {
+      try { folder.addFile(file); } catch (_) {}
+    }
+
+    // 2) Remove from other parents (best effort) to keep Drive tidy.
+    try {
+      var ps = file.getParents();
+      while (ps.hasNext()) {
+        var p2 = ps.next();
+        if (p2 && p2.getId && p2.getId() !== folderId) {
+          try { p2.removeFile(file); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
+    // 3) Settle delay + verify (Drive indexing can lag). Retry once if needed.
+    try { Utilities.sleep(600); } catch (_) {}
+    if (!hasParent_()) {
+      try { folder.addFile(file); } catch (_) {}
+      try { Utilities.sleep(600); } catch (_) {}
+
+      // Re-run parent cleanup once after retry.
+      try {
+        var ps2 = file.getParents();
+        while (ps2.hasNext()) {
+          var p3 = ps2.next();
+          if (p3 && p3.getId && p3.getId() !== folderId) {
+            try { p3.removeFile(file); } catch (_) {}
+          }
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+}
+
+
+function ensureEntriesResponsesSpreadsheet_(rallyName, rallyFolder) {
+  var name = rallyName || 'Rally';
+  // Entries Responses live inside the rally folder (same folder as the working spreadsheet),
+  // but as a separate file to keep the working workbook clean.
+  var folder = rallyFolder || ensureRallyStorage_(name).rallyFolder;
+  var base = 'Entries Responses – ' + name;
+  var variants = nameVariants_(base);
+
+  // Try find existing by name variants.
+  var f = firstFileByNameVariants_(folder, variants);
+  if (f) {
+    try { return SpreadsheetApp.openById(f.getId()); } catch (_) {}
+  }
+
+  // Create new, then move into the base folder.
+  var ss = SpreadsheetApp.create(base);
+  try {
+    var file = DriveApp.getFileById(ss.getId());
+    moveFileToFolder_(file, folder);
+  } catch (_) {}
+
+  return ss;
+}
+
+// === High-level structure ====================================================
+// 1) Core utilities & storage (Drive/Sheets/errors/helpers)
+// 2) CONTROLS (STC + Marshal) – sheets, forms, uploadControls, STC Day 1 handler
+// 3) ADMIN / ENTRIES – uploadEntries stub, entry form handling & triggers,
+//    downloadEntries.
+// This file currently serves both worlds; naming in the Admin UI may still
+// refer to "entrant" where the underlying form is the STC form. That is a
+// cosmetic/UI naming issue only; the APIs below are stable for v2.3.
+
+const PROP_PREFIX = 'rally_controls_';
+const ROOT_FOLDER_NAME = 'Time & Distance Rallies';
+const CONTROLS_SHEET_NAME = 'ControlsConfig';
+const ERRORS_SHEET_NAME = 'Errors';
+
+const MASTER_SCRIPT_NAME = 'Rally Controls – Master';
+/**
+ * Convenience for ScriptProperties.
+ */
+function getProps_() {
+  return PropertiesService.getScriptProperties();
+}
+
+
+
+// ------------------------------
+// Form Watermarks (by Form ID)
+// ------------------------------
+// We store stable routing metadata keyed by Form ID so handlers never depend on editable form titles.
+// Keys are in ScriptProperties, invisible to users, and survive title/description edits.
+const FORMTAG_PREFIX = 'FORMTAG_';
+
+function setFormTag_(formId, tagObj) {
+  if (!formId) return;
+  try {
+    getProps_().setProperty(FORMTAG_PREFIX + String(formId), JSON.stringify(tagObj || {}));
+  } catch (_) {}
+}
+
+function getFormTag_(formId) {
+  if (!formId) return null;
+  try {
+    var s = getProps_().getProperty(FORMTAG_PREFIX + String(formId));
+    if (!s) return null;
+    return JSON.parse(s);
+  } catch (_) {
+    return null;
+  }
+}
+
+function tagForm_(form, kind, dayVal, rallyName, rallyFolderId) {
+  if (!form || !form.getId) return;
+  try {
+    setFormTag_(form.getId(), {
+      kind: String(kind || ''),
+      day: Number(dayVal || 0),
+      rallyName: String(rallyName || ''),
+      rallyFolderId: String(rallyFolderId || ''),
+      taggedAt: (new Date()).toISOString()
+    });
+  } catch (_) {}
+}
+/**
+ * Web App entry point.
+ *
+ * Supported modes:
+ *  - ping
+ *  - initForms   (optional: rallyName, day)
+ *  - uploadControls (data JSON string)
+ */
+function doGet(e) {
+  try {
+    Logger.log("DIAG doGet params: " + JSON.stringify(e && e.parameter));
+  if (e && e.parameter && e.parameter.mode === 'diag') {
+    return ContentService.createTextOutput(JSON.stringify({
+      ok:true,
+      mode:'diag',
+      version: typeof RC_VERSION !== 'undefined' ? RC_VERSION : 'unknown',
+      params: e.parameter,
+      props: PropertiesService.getScriptProperties().getProperties()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  } catch(err) {}
+
+
+// v2.56 DIAG: log every doGet (sheet fallback)
+var __mode = (e && e.parameter && e.parameter.mode) ? String(e.parameter.mode) : '';
+var __rally = (e && e.parameter && (e.parameter.rallyName || e.parameter.rallyTitle)) ? String(e.parameter.rallyName || e.parameter.rallyTitle) : '';
+var __flags = { didSetup: (__mode === 'uploadEntries' || __mode === 'uploadControls' || __mode === 'setupRallyEntries' || __mode === 'initForms'), didBind: (__mode === 'uploadEntries') };
+
+  // Remember last rally name to improve error logging without creating junk folders
+  try {
+    var rn = (e && e.parameter && e.parameter.rallyName) ? String(e.parameter.rallyName) : '';
+    if (!rn && e && e.parameter && e.parameter.data) {
+      try { var tmp = JSON.parse(e.parameter.data); if (tmp && tmp.rallyName) rn = String(tmp.rallyName); } catch(_){}
+    }
+    if (rn) PropertiesService.getScriptProperties().setProperty('LAST_RALLY_NAME', rn);
+  } catch (_) {}
+  var mode = (e && e.parameter && e.parameter.mode) || 'ping';
+  var rallyNameFromQuery =
+    (e && e.parameter && (e.parameter.rallyName || e.parameter.rally)) ||
+    'Rally';
+  var rallyName = normalizeRallyName_(rallyNameFromQuery);
+
+  // v2.54 diagnostics: log every doGet with mode + rally + mutation intent.
+  var __p = (e && e.parameter) ? e.parameter : {};
+  var __mode = mode || 'ping';
+  var __rally = rallyName || '';
+  var __willMutate = !(__mode === 'ping' || __mode === 'adminStatus');
+  var __flags = { willMutate: __willMutate, hasScriptUrl: !!(__p && (__p.scriptUrl || __p.webappUrl)) };
+  try {
+    console.log('[RC doGet]', new Date().toISOString(), 'mode=', __mode, 'rally=', __rally, JSON.stringify(__flags));
+  } catch (err) {
+    Logger.log('[RC doGet] ' + new Date().toISOString() + ' mode=' + __mode + ' rally=' + __rally + ' (log stringify failed)');
+  }
+
+  // Hard guard: never create/search Drive assets for a missing or malformed rally name.
+  if (mode !== 'ping' && !isValidRallyName_(rallyName)) {
+    return json_({
+      ok: false,
+      mode: mode,
+      error: 'Invalid rallyName',
+      rallyName: rallyName
+    });
+  }
+
+  try {
+    if (mode === 'ping') {
+      return json_({
+        ok: true,
+        mode: 'ping',
+        message: 'Rally Controls script is alive (' + RC_VERSION + ')'
+      });
+    }
+
+    if (mode === 'initForms') {
+      var initResult = initForms_({
+        rallyName: rallyName,
+        day: (e && e.parameter && e.parameter.day) || '1'
+      });
+      return json_(Object.assign({ ok: true }, initResult));
+    }
+
+    
+  // ---- ADMIN: uploadEntries ----
+  if (mode === 'uploadEntries') {
+    var lock = LockService.getScriptLock();
+    lock.waitLock(30000);
+    try {
+    // Admin upload: create/refresh an "Admin - Entries" sheet inside the
+    // main Rally Controls spreadsheet for this rally, and build an
+    // Entrant Google Form for entries. SG question is conditional:
+    // - If 2+ speed groups are active -> single-choice question with
+    //   options equal to the active SG speeds (numbers only).
+    // - If only 1 speed group is active -> no SG question; SG will be
+    //   auto-assigned later when entries are processed.
+    var payload = {};
+    try {
+      payload = JSON.parse((e && e.parameter && e.parameter.data) || '{}');
+    } catch (err) {
+      payload = {};
+    }
+
+    var adminRallyName =
+      (payload && (payload.rallyTitle || payload.rallyName)) ||
+      rallyName ||
+      'Rally';
+    adminRallyName = normalizeRallyName_(adminRallyName);
+    if (!isValidRallyName_(adminRallyName)) adminRallyName = rallyName;
+
+    var storageForAdmin = ensureRallyStorage_(adminRallyName);
+    var ssAdmin = storageForAdmin.spreadsheet;
+    var rallyFolderAdmin = storageForAdmin.rallyFolder;
+    var entriesSheetName = 'Admin - Entries';
+
+    // Ensure the Admin - Entries sheet exists and has the header row.
+    var entriesSheet = ssAdmin.getSheetByName(entriesSheetName);
+    if (!entriesSheet) {
+      entriesSheet = ssAdmin.insertSheet(entriesSheetName);
+    } else {
+      entriesSheet.clear();
+    }
+
+    entriesSheet.getRange(1, 1, 1, 9).setValues([[
+      'Driver first name',
+      'Driver surname',
+      'Navigator first name',
+      'Navigator surname',
+      'Driver mobile number',
+      'Driver email',
+      'Car make/model',
+      'Car year',
+      'SG'
+    ]]);
+
+    // Column widths baseline (mm-equivalent in UI): A–G 180, H 100, I 60
+    try {
+      entriesSheet.setColumnWidths(1, 7, 180);
+      entriesSheet.setColumnWidth(8, 100);
+      entriesSheet.setColumnWidth(9, 60);
+    } catch (_) {}
+
+    // --- Entrant Google Form ---
+    var dateLabel = (payload && payload.rallyDateLabel) || '';
+    var formDriveName = 'Entries – ' + adminRallyName;
+    var entrantForm = findOrCreateFormInFolder_(rallyFolderAdmin, formDriveName);
+    // Persist Entries form id so adminStatus can remain read-only.
+    try {
+      var slug = slugRallyName_(storageForAdmin.rallyName);
+      getProps_().setProperty(PROP_PREFIX + 'entriesFormId_' + slug, entrantForm.getId());
+    } catch (_) {}
+
+    var headerText = (payload && (payload.entryFormHeaderText || payload.entryFormTitle || '')) || '';
+    headerText = headerText.toString().trim();
+
+    var formTitle = headerText || adminRallyName;
+    var description = 'Entry form';
+    entrantForm.setTitle(formTitle);
+    entrantForm.setDescription(description);
+    // IMPORTANT: Do not clear/rebuild a linked Google Form on each upload.
+    // If you delete & recreate items, Google Forms appends NEW response columns to the destination sheet.
+    var existingItems = entrantForm.getItems();
+    var isNewForm = (!existingItems || existingItems.length === 0);
+
+    if (isNewForm) {
+
+    function addEntryText_(form, title, required) {
+      var item = form.addTextItem();
+      item.setTitle(title);
+      if (required) item.setRequired(true);
+      return item;
+    }
+
+    addEntryText_(entrantForm, 'Driver first name', true);
+    addEntryText_(entrantForm, 'Driver surname', true);
+    addEntryText_(entrantForm, 'Navigator first name', true);
+    addEntryText_(entrantForm, 'Navigator surname', true);
+    addEntryText_(entrantForm, 'Driver mobile number', true);
+    addEntryText_(entrantForm, 'Driver email', true);
+    addEntryText_(entrantForm, 'Car make/model', true);
+    addEntryText_(entrantForm, 'Car year', true);
+
+    }
+
+    // Determine active SG speeds from payload.
+
+    var activeSpeeds = [];
+    if (payload && payload.speedGroups) {
+      var sg = payload.speedGroups;
+      ['sg1', 'sg2', 'sg3', 'sg4'].forEach(function(key) {
+        var cfg = sg[key];
+        if (!cfg) return;
+        // sg1 is always considered active; sg2-4 depend on an enabled flag if present.
+        var enabled = (key === 'sg1') ? true : !!cfg.enabled;
+        if (!enabled) return;
+        if (cfg.speed !== undefined && cfg.speed !== null && cfg.speed !== '') {
+          activeSpeeds.push(String(cfg.speed));
+        }
+      });
+    }
+
+    // Keep the form schema stable: update SG choices in place rather than deleting/recreating items.
+    // (Deleting/rebuilding causes Google Forms to append new response columns each time.)
+    var sgItem = null;
+    try {
+      var mcItems = entrantForm.getItems(FormApp.ItemType.MULTIPLE_CHOICE);
+      for (var mi = 0; mi < mcItems.length; mi++) {
+        var asMc = mcItems[mi].asMultipleChoiceItem();
+        if (asMc && asMc.getTitle && asMc.getTitle() === 'Speed group') {
+          sgItem = asMc;
+          break;
+        }
+      }
+    } catch (_) {
+      sgItem = null;
+    }
+
+    if (activeSpeeds.length >= 2) {
+      // Ensure a single-choice SG question with numeric options only.
+      if (!sgItem) {
+        sgItem = entrantForm.addMultipleChoiceItem();
+        sgItem.setTitle('Speed group');
+      }
+      sgItem.setRequired(true);
+      var choices = activeSpeeds.map(function(speed) {
+        return sgItem.createChoice(String(speed));
+      });
+      sgItem.setChoices(choices);
+    } else {
+      // 0 or 1 active speeds: avoid adding/removing the SG item repeatedly.
+      // If it already exists from a previous configuration, make it non-required and offer a single “Auto” option.
+      if (sgItem) {
+        sgItem.setRequired(false);
+        sgItem.setChoices([sgItem.createChoice('Auto')]);
+      }
+      // SG will be auto-assigned later when entries are moved into the Admin - Entries sheet.
+    }
+
+// Responses go into a dedicated Entries Responses spreadsheet (one level up),
+    // to keep the working sheet clean (no “Form responses 1” tab inside the working workbook).
+    var entriesResponsesSS = null;
+    var entriesResponsesUrl = '';
+    try {
+      // Prefer persisted destination (guard against environments where getDestinationId is unavailable).
+      var entriesDestKey = 'ENTRIES_RESP_SSID__' + slugRallyName_(adminRallyName);
+      var persistedDestId = '';
+      try { persistedDestId = getProps_().getProperty(entriesDestKey) || ''; } catch (_) { persistedDestId = ''; }
+      if (persistedDestId) {
+        try { entriesResponsesSS = SpreadsheetApp.openById(persistedDestId); } catch (_) { entriesResponsesSS = null; persistedDestId = ''; }
+      }
+
+      // Reuse existing destination spreadsheet if already linked (prevents 'Form responses X' clutter).
+      // NOTE: We only call setDestination once per rally (persisted in ScriptProperties).
+      if (!entriesResponsesSS) {
+        var destId = null;
+        try {
+          destId = (typeof entrantForm.getDestinationId === 'function') ? entrantForm.getDestinationId() : null;
+        } catch (_) {
+          destId = null;
+        }
+
+        if (destId) {
+          entriesResponsesSS = SpreadsheetApp.openById(destId);
+          try { getProps_().setProperty(entriesDestKey, destId); } catch (_) {}
+        } else {
+          entriesResponsesSS = ensureEntriesResponsesSpreadsheet_(adminRallyName, rallyFolderAdmin);
+          // Bind once; future runs will use entriesDestKey and skip re-binding to avoid Form responses 2/3/...
+          entrantForm.setDestination(FormApp.DestinationType.SPREADSHEET, entriesResponsesSS.getId());
+          try { getProps_().setProperty(entriesDestKey, entriesResponsesSS.getId()); } catch (_) {}
+        }
+      }
+
+      try { ensureResponseTabNamed_(entriesResponsesSS, 'Entries Responses'); } catch (_) {}
+
+      entriesResponsesUrl = entriesResponsesSS ? entriesResponsesSS.getUrl() : '';
+    } catch (eDest) {
+      // If destination set fails, upload still succeeds; adminStatus will fall back to legacy detection.
+    }
+
+    // Ensure a single onFormSubmit trigger for this entrant form.
+    ensureEntrySubmitTrigger_(entrantForm);
+
+    return json_({
+      ok: true,
+      mode: 'uploadEntries',
+      rallyName: storageForAdmin.rallyName,
+      spreadsheetUrl: ssAdmin.getUrl(),
+      sheetName: entriesSheetName,
+      responsesSheetUrl: entriesResponsesUrl,
+      entrantFormUrl: entrantForm.getPublishedUrl()
+    });
+  
+    } finally {
+      try { lock.releaseLock(); } catch (_) {}
+    }
+}
+
+
+if (mode === 'uploadControls') {
+      var dataParam = (e && e.parameter && e.parameter.data) || '';
+      var dayParam = (e && e.parameter && e.parameter.day) || '';
+      var uploadResult = uploadControls_(rallyName, dataParam, dayParam);
+      return json_(Object.assign({ ok: true }, uploadResult));
+    }
+
+    if (mode === 'uploadEntries') {
+      // Admin-side: first-time setup for entries & form (stub only for now).
+      var uploadEntriesResult = uploadEntries_({
+        rallyName: rallyName,
+        params: e && e.parameter
+      });
+      return json_(Object.assign({ ok: true }, uploadEntriesResult));
+    }
+
+    if (mode === 'downloadControls') {
+      var downloadResult = downloadControls_({
+        rallyName: rallyName,
+        day: (e && e.parameter && e.parameter.day) || '1'
+      });
+      return json_(Object.assign({ ok: true }, downloadResult));
+    }
+
+    if (mode === 'downloadEntries') {
+      return json_(downloadEntries_(rallyName));
+    }
+
+
+    if (mode === 'adminStatus') {
+      return json_(adminStatus_(rallyName));
+    }
+
+    if (mode === 'controlsStatus') {
+      return json_(controlsStatus_(rallyName, (e && e.parameter && e.parameter.day) || '1'));
+    }
+
+    return json_({
+      ok: false,
+      error: 'Unknown mode: ' + mode
+    });
+  } catch (err) {
+    // Outer catch: return JSON error only.
+    // Detailed logging is handled in the inner helpers.
+    return json_({
+      ok: false,
+      error: String(err)
+    });
+  }
+}
+
+/**
+ * Small helper to return JSON.
+ */
+function json_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Ensure a single base froot folder for all Rally Controls work.
+ */
+function ensureBaseFolder_() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+
+    // Dummy-proof root folder handling:
+    // Prefer an explicit ROOT_FOLDER_ID stored in Script Properties.
+    // Fall back to finding/creating a single folder named ROOT_FOLDER_NAME.
+    var props = getProps_();
+
+    var rootKey = PROP_PREFIX + 'rootFolderId';
+    var folderId = props.getProperty(rootKey);
+    var folder = null;
+
+    if (folderId) {
+      try {
+        folder = DriveApp.getFolderById(folderId);
+      } catch (e) {
+        folder = null;
+      }
+    }
+
+    if (!folder) {
+      // Try to find exactly one folder by name.
+      var it = DriveApp.getFoldersByName(ROOT_FOLDER_NAME);
+      var found = [];
+      while (it.hasNext()) {
+        found.push(it.next());
+        if (found.length > 2) break; // enough to know it's not unique
+      }
+
+      if (found.length === 1) {
+        folder = found[0];
+      } else if (found.length === 0) {
+        folder = DriveApp.createFolder(ROOT_FOLDER_NAME);
+      } else {
+        // More than one folder has the same name - require explicit ID.
+        throw new Error('Multiple Drive folders named "' + ROOT_FOLDER_NAME + '" were found. ' +
+          'Please keep only one, or set Script Property ' + rootKey + ' to the correct folder ID.');
+      }
+
+      // Persist for all future runs.
+      props.setProperty(rootKey, folder.getId());
+    }
+
+    return folder;
+
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+
+/**
+ * Auto-park (rename + move) this standalone Apps Script file into the root folder,
+ * once, on first real "upload" style action. This makes the setup more dummy-proof.
+ *
+ * Notes:
+ * - Works for standalone script projects created from Drive (+ → Apps Script).
+ * - For container-bound scripts (bound to a Sheet/Form), Drive file operations may fail;
+ *   in that case we just no-op.
+ */
+function autoParkMasterScriptOnce_() {
+  var props = getProps_();
+  var parkedKey = PROP_PREFIX + 'masterScriptParked';
+  if (props.getProperty(parkedKey) === '1') return;
+
+  var scriptId;
+  try {
+    scriptId = ScriptApp.getScriptId();
+  } catch (e) {
+    return; // Shouldn't happen, but don't block uploads.
+  }
+
+  var file;
+  try {
+    file = DriveApp.getFileById(scriptId);
+  } catch (e) {
+    // Likely a bound script or no Drive scope yet.
+    return;
+  }
+
+  // Ensure root folder exists (and IDs stored).
+  var rootFolder = ensureBaseFolder_();
+
+  // Rename if it's still the generic "Untitled project" or otherwise unhelpful.
+  try {
+    var currentName = file.getName() || '';
+    if (/^Untitled project$/i.test(currentName) || /^Untitled$/i.test(currentName) || !currentName.trim()) {
+      file.setName(MASTER_SCRIPT_NAME);
+    }
+  } catch (e) {
+    // Ignore rename failures.
+  }
+
+  // Add to root folder if not already present.
+  try {
+    rootFolder.addFile(file);
+  } catch (e) {
+    // Ignore add failures.
+  }
+
+  // Remove from My Drive root to reduce clutter (if present).
+  try {
+    var root = DriveApp.getRootFolder();
+    var parents = file.getParents();
+    while (parents.hasNext()) {
+      var p = parents.next();
+      if (p.getId && p.getId() === root.getId()) {
+        root.removeFile(file);
+        break;
+      }
+    }
+  } catch (e) {
+    // Ignore remove failures.
+  }
+
+  props.setProperty(parkedKey, '1');
+}
+
+
+/**
+ * Slugify rally names so we can keep per-rally IDs in ScriptProperties.
+ */
+function slugRallyName_(name) {
+  var raw = (name || 'Rally').toLowerCase();
+  raw = raw.replace(/[^a-z0-9]+/g, '_');
+  raw = raw.replace(/^_+|_+$/g, '');
+  return raw || 'rally';
+}
+
+
+function normalizeRallyName_(name) {
+  return String(name || '').trim();
+}
+
+function isValidRallyName_(name) {
+  var s = normalizeRallyName_(name);
+  if (!s) return false;
+  if (s.length > 80) return false;
+
+  // Reject values that look like internal function names or identifiers.
+  if (s.indexOf('_') !== -1) return false;
+  if (/^ensure[A-Za-z0-9]+_?$/.test(s)) return false;
+  if (/Trigger/i.test(s)) return false;
+
+  return true;
+}
+
+/**
+ * Ensure the rally folder and spreadsheet exist, with ControlsConfig + Errors.
+ *
+ * Returns:
+ *  {
+ *    rallyName: string,
+ *    baseFolder: Folder,
+ *    rallyFolder: Folder,
+ *    spreadsheet: Spreadsheet,
+ *    controlsSheet: Sheet,
+ *    errorsSheet: Sheet
+ *  }
+ */
+function ensureRallyStorage_(rallyName) {
+  var safeName = rallyName || 'Rally';
+  var slug = slugRallyName_(safeName);
+  var props = getProps_();
+
+  var baseFolder = ensureBaseFolder_();
+
+  // Rally folder
+  var rallyFolderNameBase = 'Rally – ' + safeName;
+  var rallyFolderNameVariants = nameVariants_(rallyFolderNameBase);
+  var rallyFolderIdKey = PROP_PREFIX + 'rallyFolderId_' + slug;
+  var rallyFolderId = props.getProperty(rallyFolderIdKey);
+  var rallyFolder = null;
+
+  if (rallyFolderId) {
+    try {
+      rallyFolder = DriveApp.getFolderById(rallyFolderId);
+    } catch (e) {
+      rallyFolder = null;
+    }
+  }
+
+  if (!rallyFolder) {
+    // Find existing rally folder by any dash-variant name (avoid duplicates).
+    for (var i = 0; i < rallyFolderNameVariants.length; i++) {
+      var nm = rallyFolderNameVariants[i];
+      var it = baseFolder.getFoldersByName(nm);
+      if (it.hasNext()) {
+        rallyFolder = it.next();
+        break;
+      }
+    }
+    // Create only if missing (fresh Drive or genuinely new rally name).
+    if (!rallyFolder) {
+      rallyFolder = baseFolder.createFolder(rallyFolderNameBase);
+    }
+    props.setProperty(rallyFolderIdKey, rallyFolder.getId());
+  }
+
+  // Rally spreadsheet
+  var ssName = 'Rally Controls – ' + safeName;
+  var ssIdKey = PROP_PREFIX + 'spreadsheetId_' + slug;
+  var ssId = props.getProperty(ssIdKey);
+  var ss = null;
+
+  if (ssId) {
+  try {
+    ss = SpreadsheetApp.openById(ssId);
+    var ssFileCheck = DriveApp.getFileById(ss.getId());
+    if (ssFileCheck.isTrashed && ssFileCheck.isTrashed()) {
+      ss = null;
+    }
+  } catch (e) {
+    ss = null;
+  }
+}
+
+
+  if (!ss) {
+    var fIter = rallyFolder.getFilesByName(ssName);
+    if (fIter.hasNext()) {
+      var file = fIter.next();
+      ss = SpreadsheetApp.openById(file.getId());
+    } else {
+      ss = SpreadsheetApp.create(ssName);
+      var newFile = DriveApp.getFileById(ss.getId());
+      rallyFolder.addFile(newFile);
+          try { DriveApp.getRootFolder().removeFile(newFile); } catch (e) { /* not in root */ }
+}
+    props.setProperty(ssIdKey, ss.getId());
+  } else {
+    var ssFile = DriveApp.getFileById(ss.getId());
+    rallyFolder.addFile(ssFile);
+      try { DriveApp.getRootFolder().removeFile(ssFile); } catch (e) { /* not in root */ }
+}
+
+  // ControlsConfig
+  var controlsSheet = ss.getSheetByName(CONTROLS_SHEET_NAME);
+  if (!controlsSheet) {
+    controlsSheet = ss.insertSheet(CONTROLS_SHEET_NAME);
+  }
+
+  // Errors
+  var errorsSheet = ss.getSheetByName(ERRORS_SHEET_NAME);
+  if (!errorsSheet) {
+    errorsSheet = ss.insertSheet(ERRORS_SHEET_NAME);
+    errorsSheet.appendRow([
+      'Timestamp',
+      'Where',
+      'Message',
+      'Stack',
+      'Context JSON'
+    ]);
+  } else if (errorsSheet.getLastRow() === 0) {
+    errorsSheet.appendRow([
+      'Timestamp',
+      'Where',
+      'Message',
+      'Stack',
+      'Context JSON'
+    ]);
+  }
+
+  // Optional: remove Sheet1 if the spreadsheet has extra sheets
+  var defaultSheet = ss.getSheetByName('Sheet1');
+  if (defaultSheet && ss.getSheets().length > 2) {
+    ss.deleteSheet(defaultSheet);
+  }
+
+  return {
+    rallyName: safeName,
+    baseFolder: baseFolder,
+    rallyFolder: rallyFolder,
+    spreadsheet: ss,
+    controlsSheet: controlsSheet,
+    errorsSheet: errorsSheet
+  };
+}
+
+/**
+ * Read-only lookup for an existing rally spreadsheet.
+ * Does NOT create folders, spreadsheets or sheets.
+ */
+function findRallySpreadsheet_(rallyName) {
+  var safeName = rallyName || 'Rally';
+  var slug = slugRallyName_(safeName);
+  var props = getProps_();
+  var baseFolder = ensureBaseFolder_();
+
+  // Tolerate historical dash variants in Drive item names.
+  var ssNameBase = 'Rally Controls – ' + safeName;
+  var ssNameVariants = nameVariants_(ssNameBase);
+  var ssIdKey = PROP_PREFIX + 'spreadsheetId_' + slug;
+  var ssId = props.getProperty(ssIdKey);
+  var ss = null;
+
+  if (ssId) {
+  try {
+    ss = SpreadsheetApp.openById(ssId);
+    var ssFileCheck2 = DriveApp.getFileById(ss.getId());
+    if (ssFileCheck2.isTrashed && ssFileCheck2.isTrashed()) {
+      ss = null;
+    }
+  } catch (e) {
+    ss = null;
+  }
+}
+
+
+  if (!ss) {
+    // Try via rally folder if it already exists.
+    var rallyFolderNameBase = 'Rally – ' + safeName;
+    var rallyFolderNameVariants = nameVariants_(rallyFolderNameBase);
+    var rallyFolderIdKey = PROP_PREFIX + 'rallyFolderId_' + slug;
+    var rallyFolderId = props.getProperty(rallyFolderIdKey);
+    var rallyFolder = null;
+
+    if (rallyFolderId) {
+      try {
+        rallyFolder = DriveApp.getFolderById(rallyFolderId);
+      } catch (e) {
+        rallyFolder = null;
+      }
+    }
+
+    if (!rallyFolder) {
+      for (var v = 0; v < rallyFolderNameVariants.length; v++) {
+        var rfIter = baseFolder.getFoldersByName(rallyFolderNameVariants[v]);
+        if (rfIter.hasNext()) {
+          rallyFolder = rfIter.next();
+          props.setProperty(rallyFolderIdKey, rallyFolder.getId());
+          break;
+        }
+      }
+    }
+
+    if (rallyFolder) {
+      var ssFile = firstFileByNameVariants_(rallyFolder, ssNameVariants);
+      if (ssFile) {
+        ss = SpreadsheetApp.openById(ssFile.getId());
+        props.setProperty(ssIdKey, ss.getId());
+      }
+    }
+  }
+
+  return ss;
+}
+
+
+/**
+ * Append a single error row for a given rally into that rally’s Errors sheet.
+ */
+function logError_(a, b, c, d) {
+  // Supports BOTH calling styles:
+  //   logError_(rallyName, where, err, context)
+  //   logError_(where, err, context)   // legacy/internal convenience
+  try {
+    var rallyName = '';
+    var where = '';
+    var err = null;
+    var context = null;
+
+    // Detect signature
+    if (typeof a === 'string' && (b && (b.message || b.stack) || typeof b === 'string') && c !== undefined && d === undefined) {
+      // logError_(where, err, context)
+      where = a;
+      err = b;
+      context = c;
+    } else if (typeof a === 'string' && (b && (b.message || b.stack) || typeof b === 'string') && c === undefined) {
+      // logError_(where, err)
+      where = a;
+      err = b;
+      context = null;
+    } else {
+      // logError_(rallyName, where, err, context)
+      rallyName = a || '';
+      where = b || '';
+      err = c;
+      context = d || null;
+    }
+
+    // Best-effort rallyName recovery
+    if (!rallyName && context && context.rallyName) rallyName = String(context.rallyName);
+    if (!rallyName) {
+      var last = PropertiesService.getScriptProperties().getProperty('LAST_RALLY_NAME') || '';
+      if (last) rallyName = last;
+    }
+
+    // If we still don't have a rally name, do NOT create Drive assets just to log.
+    if (!rallyName) {
+      console.error('[ERROR]', where, err, context || '');
+      return;
+    }
+
+    var storage = ensureRallyStorage_(rallyName);
+    var sheet = storage.errorsSheet;
+
+    var message = err && err.message ? String(err.message) : String(err);
+    var stack = err && err.stack ? String(err.stack) : '';
+    var ctx = context ? JSON.stringify(context) : '';
+
+    sheet.appendRow([ new Date(), where || '', message, stack, ctx ]);
+  } catch (logErr) {
+    console.error('logError_ failed', logErr, 'original:', a, b, c, d);
+  }
+}
+
+/**
+ * Build skeleton STC Day N and Marshal Day N sheets
+ * from the uploaded controls config. This ONLY sets up
+ * the column headers; entrant rows will be populated later
+ * from the entries system.
+ *
+ * Sheet layouts:
+ *   STC Day X:     Entrant | # | STC 1 | STC 2 | ... | STC n
+ *   Marshal Day X: Entrant | # | Marshal 1 | Marshal 2 | ... | Marshal m
+ */
+
+function buildDaySheetsForControls_(ss, parsed, dayOnly) {
+  if (!parsed || !Array.isArray(parsed.days)) {
+    return;
+  }
+  parsed.days.forEach(function (d) {
+    if (dayOnly && d && d.day != null && String(d.day) !== String(dayOnly)) { return; }
+    if (!d) return;
+    var dayVal = (d.day != null) ? String(d.day) : '';
+    if (dayOnly && String(dayVal) !== String(dayOnly)) { return; }
+    if (!dayVal) return;
+
+    var controls = Array.isArray(d.controls) ? d.controls : [];
+
+    var stcControls = controls.filter(function (c) {
+      return c && c.type === 'stc' && c.enabled;
+    });
+    var marshalControls = controls.filter(function (c) {
+      return c && c.type === 'marshal' && c.enabled;
+    });
+
+    // STC Day sheet
+    if (stcControls.length > 0) {
+      var stcSheetName = 'STC Day ' + dayVal;
+      var stcSheet = ss.getSheetByName(stcSheetName);
+      if (!stcSheet) {
+        stcSheet = ss.insertSheet(stcSheetName);
+      } else {
+        stcSheet.clearContents();
+      }
+      var stcHeader = ['Entrant', '#'];
+      for (var i = 0; i < stcControls.length; i++) {
+        stcHeader.push('STC ' + (i + 1));
+      }
+      stcSheet.getRange(1, 1, 1, stcHeader.length).setValues([stcHeader]);
+
+      // Pre-populate Entrant and # from uploaded entrants list (if present)
+      if (parsed && Array.isArray(parsed.entrants) && parsed.entrants.length > 0) {
+        var stcRows = parsed.entrants.map(function (e) {
+          var name = (e && e.name != null) ? String(e.name) : '';
+          var rallyNo = (e && e.rallyNo != null) ? String(e.rallyNo) : '';
+          return [name, rallyNo];
+        });
+        stcSheet.getRange(2, 1, stcRows.length, 2).setValues(stcRows);
+      }
+    }
+
+    // Marshal Day sheet
+    if (marshalControls.length > 0) {
+      var mSheetName = 'Marshal Day ' + dayVal;
+      var mSheet = ss.getSheetByName(mSheetName);
+      if (!mSheet) {
+        mSheet = ss.insertSheet(mSheetName);
+      } else {
+        mSheet.clearContents();
+      }
+      var mHeader = ['#'];
+      for (var j = 0; j < marshalControls.length; j++) {
+        mHeader.push('Marshal ' + (j + 1));
+      }
+      mSheet.getRange(1, 1, 1, mHeader.length).setValues([mHeader]);
+    }
+  });
+}
+
+function findOrCreateFormInFolder_(folder, fileName) {
+  if (!folder) {
+    throw new Error('findOrCreateFormInFolder_ called without folder');
+  }
+  var files = folder.getFilesByName(fileName);
+  var form;
+  if (files.hasNext()) {
+    var file = files.next();
+    form = FormApp.openById(file.getId());
+  } else {
+    form = FormApp.create(fileName);
+    try {
+      var file = DriveApp.getFileById(form.getId());
+      folder.addFile(file);
+          try { DriveApp.getRootFolder().removeFile(file); } catch (e) { /* not in root */ }
+} catch (e) {
+      console.warn('Could not move form into rally folder', e);
+    }
+  }
+  return form;
+}
+
+function findOrCreateSpreadsheetInFolder_(folder, fileName) {
+  if (!folder) {
+    throw new Error('findOrCreateSpreadsheetInFolder_ called without folder');
+  }
+  var files = folder.getFilesByName(fileName);
+  var ss;
+  if (files.hasNext()) {
+    var file = files.next();
+    ss = SpreadsheetApp.openById(file.getId());
+  } else {
+    ss = SpreadsheetApp.create(fileName);
+    try {
+      var file = DriveApp.getFileById(ss.getId());
+      folder.addFile(file);
+      try { DriveApp.getRootFolder().removeFile(file); } catch (e) { /* not in root */ }
+    } catch (e) {
+      console.warn('Could not move spreadsheet into rally folder', e);
+    }
+  }
+  return ss;
+}function ensureResponseTabNamed_(ss, desiredTabName) {
+  if (!ss || !desiredTabName) return;
+  try {
+    // If already present, do nothing.
+    if (ss.getSheetByName(desiredTabName)) return;
+
+    // Prefer Google's response sheet naming patterns.
+    var sheets = ss.getSheets();
+    var candidate = null;
+
+    // First, exact common names.
+    var exactNames = ['Form Responses 1', 'Form responses 1', 'Form_Responses1', 'Form_Responses 1', 'Responses 1'];
+    for (var i = 0; i < exactNames.length; i++) {
+      var sh = ss.getSheetByName(exactNames[i]);
+      if (sh) { candidate = sh; break; }
+    }
+
+    // Fallback: match "Form responses N" (choose the lowest N).
+    if (!candidate) {
+      var bestN = 9999;
+      for (var j = 0; j < sheets.length; j++) {
+        var name = sheets[j].getName();
+        var mm = name.match(/^Form[\s_]*responses[\s_]*(\d+)$/i);
+        if (mm) {
+          var n = parseInt(mm[1], 10);
+          if (!isNaN(n) && n < bestN) {
+            bestN = n;
+            candidate = sheets[j];
+          }
+        }
+      }
+    }
+
+    if (candidate) {
+      candidate.setName(desiredTabName);
+    }
+  } catch (_) {}
+}
+
+
+
+function pruneOldFormResponseTabs_(ss, desiredTabName) {
+  // Keep the newest "Form responses N" sheet and remove older ones,
+  // also removing any previous desiredTabName sheet so we end with ONE clean tab.
+  if (!ss) return;
+  try {
+    var sheets = ss.getSheets();
+    var newest = null;
+    var newestN = -1;
+
+    // Identify newest response sheet by highest suffix N.
+    for (var i = 0; i < sheets.length; i++) {
+      var nm = sheets[i].getName();
+      var mm = nm.match(/^Form[\s_]*responses[\s_]*(\d+)$/i);
+      if (mm) {
+        var n = parseInt(mm[1], 10);
+        if (!isNaN(n) && n > newestN) { newestN = n; newest = sheets[i]; }
+      }
+    }
+
+    // If none matched, nothing to prune.
+    if (!newest) return;
+
+    // Delete any old renamed response tab (desiredTabName) if it's not the newest sheet.
+    if (desiredTabName) {
+      var oldDesired = ss.getSheetByName(desiredTabName);
+      if (oldDesired && oldDesired.getSheetId() !== newest.getSheetId()) {
+        ss.deleteSheet(oldDesired);
+      }
+    }
+
+    // Delete all other "Form responses N" sheets except newest.
+    sheets = ss.getSheets(); // refresh after possible delete
+    for (var j = 0; j < sheets.length; j++) {
+      var name2 = sheets[j].getName();
+      var m2 = name2.match(/^Form[\s_]*responses[\s_]*(\d+)$/i);
+      if (m2 && sheets[j].getSheetId() !== newest.getSheetId()) {
+        ss.deleteSheet(sheets[j]);
+      }
+    }
+
+    // Rename newest to desiredTabName if provided.
+    if (desiredTabName) {
+      try { newest.setName(desiredTabName); } catch (_) {}
+    }
+  } catch (_) {}
+}
+
+
+// --- Deferred response-sheet cleanup (avoids races after relinking) ---
+
+function queueResponseSheetCleanup_(spreadsheetId, desiredTabName) {
+  if (!spreadsheetId) return;
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var key = 'RC_RESP_CLEANUP_QUEUE';
+    var raw = props.getProperty(key);
+    var arr = [];
+    if (raw) {
+      try { arr = JSON.parse(raw); } catch (_) { arr = []; }
+    }
+
+    // De-dupe by spreadsheetId+desiredTabName.
+    var found = false;
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i] && arr[i].ssid === spreadsheetId && arr[i].tab === desiredTabName) { found = true; break; }
+    }
+    if (!found) arr.push({ ssid: spreadsheetId, tab: desiredTabName, t: Date.now() });
+
+    props.setProperty(key, JSON.stringify(arr));
+
+    // Ensure we have exactly one near-term trigger.
+    var triggers = ScriptApp.getProjectTriggers();
+    var have = false;
+    for (var j = 0; j < triggers.length; j++) {
+      if (triggers[j].getHandlerFunction && triggers[j].getHandlerFunction() === 'runQueuedResponseSheetCleanups_') {
+        have = true; break;
+      }
+    }
+    if (!have) {
+      // Run shortly after upload so the new "Form responses N" tab has time to appear.
+      ScriptApp.newTrigger('runQueuedResponseSheetCleanups_').timeBased().after(60 * 1000).create();
+    }
+  } catch (_) {}
+}
+
+function runQueuedResponseSheetCleanups_() {
+  var key = 'RC_RESP_CLEANUP_QUEUE';
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var raw = props.getProperty(key);
+    if (!raw) {
+      cleanupSelfTrigger_('runQueuedResponseSheetCleanups_');
+      return;
+    }
+    var arr = [];
+    try { arr = JSON.parse(raw); } catch (_) { arr = []; }
+
+    for (var i = 0; i < arr.length; i++) {
+      var job = arr[i];
+      if (!job || !job.ssid) continue;
+      try {
+        var ss = SpreadsheetApp.openById(job.ssid);
+        var desired = job.tab || null;
+        pruneOldFormResponseTabs_(ss, desired);
+        if (desired) ensureResponseTabNamed_(ss, desired);
+      } catch (_) {}
+    }
+
+    // Clear queue and remove trigger.
+    props.deleteProperty(key);
+    cleanupSelfTrigger_('runQueuedResponseSheetCleanups_');
+  } catch (_) {
+    // Don't loop forever; clear queue on hard error.
+    try { PropertiesService.getScriptProperties().deleteProperty(key); } catch (_) {}
+    cleanupSelfTrigger_('runQueuedResponseSheetCleanups_');
+  }
+}
+
+function cleanupSelfTrigger_(handlerName) {
+  try {
+    var triggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < triggers.length; i++) {
+      if (triggers[i].getHandlerFunction && triggers[i].getHandlerFunction() === handlerName) {
+        ScriptApp.deleteTrigger(triggers[i]);
+      }
+    }
+  } catch (_) {}
+}
+
+
+function responseTabNameFromFileName_(responseSheetFileName) {
+  var s = (responseSheetFileName || '').toString();
+
+  // Entries
+  if (/^Entries\s+Responses\b/i.test(s)) return 'Entries Responses';
+
+  // STC / Marshal with Day number if present
+  var dayMatch = s.match(/\bDay\s*(\d+)\b/i);
+  var dayPart = dayMatch ? (' D' + dayMatch[1]) : '';
+  if (/\bSTC\b/i.test(s)) return 'STC' + dayPart + ' Responses';
+  if (/\bMarshal\b/i.test(s)) return 'Marshal' + dayPart + ' Responses';
+
+  // Generic fallback
+  if (s) return s;
+  return 'Responses';
+}
+
+
+
+function safeDeleteAllResponses_(form) {
+  if (!form) return;
+  try {
+    if (typeof form.deleteAllResponses === 'function') {
+      form.deleteAllResponses();
+    }
+  } catch (e) {
+    // Non-fatal: we can continue even if old responses couldn't be cleared.
+  }
+}
+
+function ensureFormHasResponseSheet_(rallyFolder, form, responseSheetName) {
+  if (!form) return;
+
+  // Each time the form schema is rebuilt, Google can append new columns to the existing
+  // response sheet because item IDs change. The cleanest "slate refresh" is:
+  // - relink destination (forces a fresh "Form responses N" tab)
+  // - delete older "Form responses" tabs and keep only the newest (no trash, no clutter)
+  var destId = null;
+  try {
+    destId = (typeof form.getDestinationId === 'function') ? form.getDestinationId() : null;
+  } catch (e) {
+    destId = null;
+  }
+
+  // Ensure we have a destination spreadsheet in the rally folder.
+  var respSs = null;
+  if (destId) {
+    try { respSs = SpreadsheetApp.openById(destId); } catch (_) { respSs = null; }
+  }
+  if (!respSs) {
+    respSs = findOrCreateSpreadsheetInFolder_(rallyFolder, responseSheetName);
+  }
+
+  // Relink destination to force a fresh response tab.
+  try {
+    if (typeof form.removeDestination === 'function') form.removeDestination();
+  } catch (_) {}
+
+  form.setDestination(FormApp.DestinationType.SPREADSHEET, respSs.getId());
+
+  // Queue a post-link cleanup. Google sometimes creates/attaches the new response tab asynchronously,
+// so pruning immediately can miss the freshly-created tab. We queue a short delayed cleanup
+// (no Drive trash; leaves ONE response tab).
+  var desiredTab = responseTabNameFromFileName_(responseSheetName);
+  queueResponseSheetCleanup_(respSs.getId(), desiredTab);
+
+  // Best-effort immediate prune/rename (may be finalized by delayed cleanup).
+  try { pruneOldFormResponseTabs_(respSs, desiredTab); } catch (_) {}
+  try { ensureResponseTabNamed_(respSs, desiredTab); } catch (_) {}
+}
+
+
+
+/**
+ * buildFormsForControls_:
+ * - For each day in parsed.days, builds/updates per-day STC and Marshal forms.
+ * - Forms are created inside the rally folder and pointed at per-form response spreadsheets (NOT the rally spreadsheet).
+ * - Question sets follow the spec agreed for v1.08.
+ */
+
+function getMaxCarsFromParsed_(parsed) {
+  if (!parsed) return 30;
+  // Prefer explicit entrantsCount if provided by the upload JSON.
+  if (typeof parsed.entrantsCount === 'number' && parsed.entrantsCount > 0) {
+    return parsed.entrantsCount;
+  }
+  // Fallback: if an entries array is provided, use its length.
+  if (Array.isArray(parsed.entries) && parsed.entries.length > 0) {
+    return parsed.entries.length;
+  }
+  // Final fallback for older uploads / R&D: keep previous default.
+  return 30;
+}
+
+/**
+ * buildFormsForControls_:
+ * - For each day in parsed.days, builds/updates per-day STC and Marshal forms.
+ * - Forms are created inside the rally folder and pointed at per-form response spreadsheets (NOT the rally spreadsheet).
+ * - Question sets follow the spec agreed for v1.09.
+ */
+function buildFormsForControls_(rallyFolder, ss, rallyName, parsed, dayOnly) {
+  if (!rallyFolder || !ss) return;
+  if (!parsed || !Array.isArray(parsed.days)) return;
+
+  var rallyTitle = rallyName || ss.getName();
+
+  parsed.days.forEach(function (d) {
+    if (!d) return;
+    var dayVal = (d.day != null) ? String(d.day) : '';
+    if (!dayVal) return;
+    if (dayOnly && String(dayVal) !== String(dayOnly)) { return; }
+
+    var controls = Array.isArray(d.controls) ? d.controls : [];
+
+    var stcControls = controls.filter(function (c) {
+      return c && c.type === 'stc' && c.enabled;
+    });
+    var marshalControls = controls.filter(function (c) {
+      return c && c.type === 'marshal' && c.enabled;
+    });
+
+    if (stcControls.length === 0 && marshalControls.length === 0) {
+      return;
+    }
+
+    // --- STC form per day ---
+    if (stcControls.length > 0) {
+      var stcDriveName = 'STC – Day ' + dayVal + ' – ' + rallyTitle;
+      var stcFormTitle = rallyTitle + ' – STC Times – Day ' + dayVal;
+      var stcForm = findOrCreateFormInFolder_(rallyFolder, stcDriveName);
+      stcForm.setTitle(stcFormTitle);
+      stcForm.setDescription('');
+      tagForm_(stcForm, 'STC', dayVal, rallyTitle, rallyFolder.getId());
+      safeDeleteAllResponses_(stcForm);
+
+      // Clear existing items
+      var stcItems = stcForm.getItems();
+      for (var i = stcItems.length - 1; i >= 0; i--) {
+        stcForm.deleteItem(stcItems[i]);
+      }
+
+      // 1) Rally Number (required, numeric)
+      var rallyNumItem = stcForm.addTextItem();
+      rallyNumItem.setTitle('Rally Number').setRequired(true);
+      try {
+        var numValidation = FormApp.createTextValidation()
+          .requireTextMatchesPattern('^\\d+$')
+          .build();
+        rallyNumItem.setValidation(numValidation);
+      } catch (eNum) {
+        console.warn('Could not set number validation for Rally Number', eNum);
+      }
+
+      // 2) Driver Surname (required)
+      var surnameItem = stcForm.addTextItem();
+      surnameItem.setTitle('Driver Surname').setRequired(true);
+
+      // 3) How to enter times (section header with help text)
+      var infoItem = stcForm.addSectionHeaderItem();
+      infoItem.setTitle('Time Entries');
+      infoItem.setHelpText('Leading zeros are not required.\nExamples:\n9:25 – time under an hour\n1:45:00 – no leading "0".');
+
+      // 4) STC 1..n time fields (required)
+      stcControls.forEach(function (c, idx) {
+        var stcItem = stcForm.addTextItem();
+        stcItem.setTitle('STC ' + (idx + 1));
+        stcItem.setRequired(true);
+      });
+
+      // 5) I have checked my times (checkbox, required)
+      var stcCheckItem = stcForm.addCheckboxItem();
+      stcCheckItem.setTitle('I have checked my times');
+      stcCheckItem.setChoiceValues(['Yes']);
+      stcCheckItem.setRequired(true);
+
+      // Destination: rally spreadsheet
+      // Only set destination the first time; repeated calls can create extra
+      // "Form responses" tabs. If the form already has a destination, reuse it.
+      ensureFormHasResponseSheet_(rallyFolder, stcForm, 'STC Responses – Day ' + dayVal + ' – ' + rallyTitle);
+
+      ensureFormSubmitTriggerForForm_(stcForm, 'handleStcSubmit_AllDays_');
+    }
+
+    // --- Marshal form per day ---
+    if (marshalControls.length > 0) {
+      var marshalDriveName = 'Marshals – Day ' + dayVal + ' – ' + rallyTitle;
+      var marshalFormTitle = rallyTitle + ' – Marshal – Day ' + dayVal;
+      var marshalForm = findOrCreateFormInFolder_(rallyFolder, marshalDriveName);
+      marshalForm.setTitle(marshalFormTitle);
+      marshalForm.setDescription('');
+      tagForm_(marshalForm, 'MARSHAL', dayVal, rallyTitle, rallyFolder.getId());
+      safeDeleteAllResponses_(marshalForm);
+
+      // Clear existing items
+      var mItems = marshalForm.getItems();
+      for (var j = mItems.length - 1; j >= 0; j--) {
+        marshalForm.deleteItem(mItems[j]);
+      }
+
+      // 1) Marshal Number (required, numeric)
+      var marshalNumItem = marshalForm.addTextItem();
+      marshalNumItem.setTitle('Marshal Number').setRequired(true);
+      try {
+        var mNumValidation = FormApp.createTextValidation()
+          .requireTextMatchesPattern('^\\d+$')
+          .build();
+        marshalNumItem.setValidation(mNumValidation);
+      } catch (eMN) {
+        Logger.log('WARN: marshal number validation not applied: ' + eMN);
+      }
+
+      // 2) Marshal Times (read-only info block; populated from upload JSON if present)
+      // - Uses parsed.marshalWindowsText (preferred) or builds from parsed.marshalWindows[]
+      try {
+        var marshalTimesText = '';
+        if (parsed && typeof parsed.marshalWindowsText === 'string' && parsed.marshalWindowsText.trim()) {
+          marshalTimesText = parsed.marshalWindowsText.trim();
+        } else if (parsed && Array.isArray(parsed.marshalWindows) && parsed.marshalWindows.length) {
+          marshalTimesText = parsed.marshalWindows
+            .map(function (w) {
+              if (!w) return '';
+              var label = (w.label != null ? String(w.label) : '').trim();
+              if (!label) {
+                var n = (w.id != null ? String(w.id) : '').trim();
+                label = n ? ('Marshal ' + n) : 'Marshal';
+              }
+              var firstEta = (w.firstEta != null ? String(w.firstEta) : '').trim();
+              var lastEta  = (w.lastEta  != null ? String(w.lastEta)  : '').trim();
+              if (!firstEta && !lastEta) return '';
+              return label + ' — ' + firstEta + ' – ' + lastEta;
+            })
+            .filter(function (s) { return s; })
+            .join('\n');
+        }
+
+        if (marshalTimesText) {
+          var mTimesItem = marshalForm.addSectionHeaderItem();
+          mTimesItem.setTitle('ETA time of cars at Marshal location');
+          mTimesItem.setHelpText(marshalTimesText);
+        }
+      } catch (eMT) {
+        console.warn('Could not add Marshal Times block', eMT);
+      }
+
+
+      // 3) How to enter times (section header with help text)
+      var mInfoItem = marshalForm.addSectionHeaderItem();
+      mInfoItem.setTitle('Time Entries');
+      mInfoItem.setHelpText('Leading zeros are not required.\nExamples:\n9:25 – time under an hour\n1:45:00 – no leading "0".');
+
+      // 3) Car 1..N Time fields (required) - based on entrants count from upload (fallback 30)
+      var maxCars = getMaxCarsFromParsed_(parsed);
+      for (var carNo = 1; carNo <= maxCars; carNo++) {
+        var carItem = marshalForm.addTextItem();
+        carItem.setTitle('Car ' + carNo + ' Time');
+        carItem.setRequired(true);
+      }
+
+      // 4) I have checked the times (checkbox, required)
+      var mCheckItem = marshalForm.addCheckboxItem();
+      mCheckItem.setTitle('I have checked the times');
+      mCheckItem.setChoiceValues(['Yes']);
+      mCheckItem.setRequired(true);
+
+      // Destination: rally spreadsheet
+      // Only set destination the first time; repeated calls can create extra
+      // "Form responses" tabs. If the form already has a destination, reuse it.
+      ensureFormHasResponseSheet_(rallyFolder, marshalForm, 'Marshal Responses – Day ' + dayVal + ' – ' + rallyTitle);
+
+      ensureFormSubmitTriggerForForm_(marshalForm, 'handleMarshalSubmit_AllDays_');
+
+    }
+  });
+}
+
+
+
+/**
+ * initForms_:
+ * - Ensures rally folder + spreadsheet + Errors sheet.
+ * - Creates/reuses Entrant and Marshal forms.
+ * - Moves forms into the rally folder.
+ * - Returns form URLs + spreadsheet URL.
+ */
+// === CONTROLS API (STC + Marshal) ============================================
+/**
+ * initForms_
+ * Resolve the STC and Marshal Google Forms and the backing spreadsheet
+ * for a given rally/day. Note: entrantFormUrl in the return value is used
+ * by the UI for historical reasons and currently carries the STC form URL.
+ */
+function initForms_(options) {
+  options = options || {};
+  var rallyName = options.rallyName || 'Rally';
+  var day = options.day || '1';
+  var dayVal = String(day || '1');
+
+  try {
+    var storage = ensureRallyStorage_(rallyName);
+    var rallyFolder = storage.rallyFolder;
+    var ss = storage.spreadsheet;
+    var rallyTitle = storage.rallyName;
+
+    // Prefer the per-day STC / Marshal forms that were built from the
+    // uploaded controls configuration (buildFormsForControls_).
+    var stcDriveName = 'STC – Day ' + dayVal + ' – ' + rallyTitle;
+    var marshalDriveName = 'Marshals – Day ' + dayVal + ' – ' + rallyTitle;
+
+    var stcForm = null;
+    var marshalForm = null;
+
+    var stcFiles = rallyFolder.getFilesByName(stcDriveName);
+    if (stcFiles.hasNext()) {
+      var stcFile = stcFiles.next();
+      stcForm = FormApp.openById(stcFile.getId());
+    }
+
+    var marshalFiles = rallyFolder.getFilesByName(marshalDriveName);
+    if (marshalFiles.hasNext()) {
+      var marshalFile = marshalFiles.next();
+      marshalForm = FormApp.openById(marshalFile.getId());
+    }
+
+    if (!stcForm && !marshalForm) {
+      throw new Error('No STC/Marshal forms found for Day ' + dayVal +
+        ' in rally "' + rallyTitle + '". Upload controls first.');
+    }
+
+    return {
+      rallyName: storage.rallyName,
+      entrantFormUrl: stcForm ? stcForm.getPublishedUrl() : '',
+      marshalFormUrl: marshalForm ? marshalForm.getPublishedUrl() : '',
+      spreadsheetUrl: ss.getUrl()
+    };
+  } catch (err) {
+    logError_(rallyName, 'initForms_', err, options);
+    throw err;
+  }
+}
+function uploadControls_(fallbackRallyName, dataJson, dayOnly) {
+  
+  // Dummy-proof: on first upload, park this master script file into the root folder.
+  autoParkMasterScriptOnce_();
+var parsed;
+  var rallyName = fallbackRallyName || 'Rally';
+
+  try {
+    if (!dataJson) {
+      throw new Error('No data payload supplied for uploadControls');
+    }
+
+
+
+    try {
+      parsed = JSON.parse(dataJson);
+    } catch (parseErr) {
+      throw new Error('Invalid JSON payload for uploadControls');
+    }
+
+    if (parsed && parsed.rallyName) {
+      rallyName = parsed.rallyName;
+    }
+
+    var storage = ensureRallyStorage_(rallyName);
+    var sheet = storage.controlsSheet;
+
+    // Clear existing config
+    sheet.clearContents();
+
+    // Header row
+    sheet.getRange(1, 1, 1, 5).setValues([['Day', 'ControlId', 'Type', 'Label', 'Enabled']]);
+
+    var rows = [];
+    if (parsed && Array.isArray(parsed.days)) {
+      parsed.days.forEach(function (d) {
+        var dayVal = d && d.day != null ? d.day : '';
+        if (dayOnly && String(dayVal) !== String(dayOnly)) { return; }
+        var controls = (d && Array.isArray(d.controls)) ? d.controls : [];
+        controls.forEach(function (c) {
+          rows.push([
+            dayVal,
+            c && c.id != null ? c.id : '',
+            c && c.type != null ? c.type : '',
+            c && c.label != null ? c.label : '',
+            c && c.enabled ? true : false
+          ]);
+        });
+      });
+    }
+
+    if (rows.length > 0) {
+      sheet.getRange(2, 1, rows.length, 5).setValues(rows);
+    }
+
+    // Build STC Day N / Marshal Day N skeleton sheets
+    buildDaySheetsForControls_(storage.spreadsheet, parsed, dayOnly);
+
+    // Build per-day STC / Marshal Google Forms for this rally
+    buildFormsForControls_(storage.rallyFolder, storage.spreadsheet, storage.rallyName, parsed, dayOnly);
+
+    // After forms are ensured, get the links for the primary day from this payload
+    var dayForLinks = '1';
+    if (parsed && Array.isArray(parsed.days) && parsed.days.length > 0) {
+      var firstDay = parsed.days[0];
+      if (firstDay && firstDay.day != null) {
+        dayForLinks = String(firstDay.day);
+      }
+    }
+
+
+    // Ensure STC Errors sheet exists for this rally.
+    ensureStcErrorsSheet_(storage.spreadsheet);
+
+    var formsInfo = null;
+    try {
+      formsInfo = initForms_({
+        rallyName: storage.rallyName,
+        day: dayForLinks
+      });
+    } catch (formsErr) {
+      // If we cannot resolve forms, keep going but return empty URLs
+      logError_(rallyName, 'uploadControls_initForms', formsErr, { day: dayForLinks });
+      formsInfo = null;
+    }
+
+    
+
+    // Best-effort: response folder for this day (where Google Form responses live)
+    var respFolder = resolveResponsesFolderForDay_(storage.rallyFolder, storage.rallyName, dayForLinks);
+return {
+      rallyName: storage.rallyName,
+      day: dayForLinks,
+      spreadsheetUrl: storage.spreadsheet.getUrl(),
+      hasControlsData: true,
+      responsesFolderId: (respFolder && respFolder.responsesFolderId) ? respFolder.responsesFolderId : '',
+      responsesFolderUrl: (respFolder && respFolder.responsesFolderUrl) ? respFolder.responsesFolderUrl : '',
+      rowsWritten: rows.length,
+      entrantFormUrl: formsInfo && formsInfo.entrantFormUrl ? formsInfo.entrantFormUrl : '',
+      marshalFormUrl: formsInfo && formsInfo.marshalFormUrl ? formsInfo.marshalFormUrl : ''
+    };
+  } catch (err) {
+    logError_(rallyName, 'uploadControls_', err, { raw: dataJson });
+    throw err;
+  }
+}
+
+// ---- DOWNLOAD CONTROLS HELPER BELOW ----
+function downloadControls_(options) {
+  var rallyName = (options && options.rallyName) || 'Rally';
+  var day = (options && options.day) || '1';
+
+  var storage = ensureRallyStorage_(rallyName);
+  var ss = storage.spreadsheet;
+
+  var stcSheetName = 'STC Day ' + day;
+  var marshalSheetName = 'Marshal Day ' + day;
+
+  var result = {
+    rallyName: storage.rallyName,
+    day: day,
+    stc: null,
+    marshal: null
+  };
+
+  function readSheet_(name) {
+    var sh = ss.getSheetByName(name);
+    if (!sh) {
+      return null;
+    }
+    var lastRow = sh.getLastRow();
+    var lastCol = sh.getLastColumn();
+    if (lastRow < 1 || lastCol < 1) {
+      return null;
+    }
+    var values = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
+    if (!values || values.length === 0) {
+      return null;
+    }
+    var header = values[0];
+    var rows = [];
+    if (values.length > 1) {
+      for (var r = 1; r < values.length; r++) {
+        rows.push(values[r]);
+      }
+    }
+    return {
+      sheetName: name,
+      header: header,
+      rows: rows
+    };
+  }
+
+  result.stc = readSheet_(stcSheetName);
+  result.marshal = readSheet_(marshalSheetName);
+
+  return result;
+}
+
+/**
+ * Admin-side stub: initial hook for entries setup & form creation.
+ * For now, this just verifies storage and echoes back rally + basic params.
+ */
+// === ADMIN / ENTRIES SECTION ================================================
+// The functions below are used by the Admin/Entries page. They share the same
+// storage helpers (ensureRallyStorage_ etc.) but are logically separate from
+// the Controls (STC/Marshal) pathways.
+
+/**
+ * uploadEntries_
+ * Currently a stub used to prove Admin → Web App → Script plumbing.
+ * Future versions may populate an Entries sheet or perform validations.
+ */
+function uploadEntries_(opts) {
+  var rallyName = (opts && opts.rallyName) || 'Rally';
+  var params = (opts && opts.params) || {};
+
+  // Reuse the same storage model as controls – single rally folder + sheet.
+  var storage = ensureRallyStorage_(rallyName);
+
+  // In this stub, we don't yet create the entries form or write any data.
+  // This is purely to prove the Admin → Web App → Script plumbing.
+  return {
+    mode: 'uploadEntries',
+    rallyName: rallyName,
+    receivedParams: params
+  };
+}
+
+// --- Admin: downloadEntries (rows only) ---
+
+/**
+ * Handle Entry form submissions and keep a single row per entrant
+ * based on Driver surname + Driver email.
+ */
+function handleEntrySubmit_(e) {
+  try {
+    var _ts0 = new Date();
+    var form = e && e.source;
+    if (!form || typeof form.getTitle !== 'function') return;
+
+    // Resolve rally name from the form description (stable) first, since the form title can be customised.
+    var rallyName = '';
+    try {
+      var desc = (form.getDescription && form.getDescription()) ? String(form.getDescription()) : '';
+      var m = desc.match(/RC_RALLY\s*=\s*([^\n\r]+)/);
+      if (m && m[1]) rallyName = String(m[1]).trim();
+    } catch (_) {}
+
+    // Fallback to title (older forms).
+    if (!rallyName) {
+      rallyName = (form.getTitle() || '').toString().trim();
+    }
+    if (!rallyName) return;
+
+    // Always write into the working (Rally Controls) spreadsheet for this rally.
+    var ssAdmin = findRallySpreadsheet_(rallyName);
+    if (!ssAdmin) return;
+
+    var entriesSheetName = 'Admin - Entries';
+    var sheet = ssAdmin.getSheetByName(entriesSheetName);
+
+    // Ensure sheet and header row exist.
+    if (!sheet) {
+      sheet = ssAdmin.insertSheet(entriesSheetName);
+      sheet.getRange(1, 1, 1, 9).setValues([[
+        'Driver first name',
+        'Driver surname',
+        'Navigator first name',
+        'Navigator surname',
+        'Driver mobile number',
+        'Driver email',
+        'Car make/model',
+        'Car year',
+        'SG'
+      ]]);
+
+      // Format columns baseline: A–G 180, H 100, I 60.
+      try { sheet.setColumnWidths(1, 7, 180); sheet.setColumnWidth(8, 100); sheet.setColumnWidth(9, 60); } catch (_) {}
+    } else if (sheet.getLastRow() < 1) {
+      sheet.getRange(1, 1, 1, 9).setValues([[
+        'Driver first name',
+        'Driver surname',
+        'Navigator first name',
+        'Navigator surname',
+        'Driver mobile number',
+        'Driver email',
+        'Car make/model',
+        'Car year',
+        'SG'
+      ]]);
+
+      // Format columns baseline: A–G 180, H 100, I 60.
+      try { sheet.setColumnWidths(1, 7, 180); sheet.setColumnWidth(8, 100); sheet.setColumnWidth(9, 60); } catch (_) {}
+    }
+
+    var itemResponses = (e && e.response && e.response.getItemResponses)
+      ? e.response.getItemResponses()
+      : [];
+    var byTitle = {};
+    for (var i = 0; i < itemResponses.length; i++) {
+      var ir = itemResponses[i];
+      var title = ir.getItem().getTitle();
+      byTitle[title] = ir.getResponse();
+    }
+
+    var driverSurname = (byTitle['Driver surname'] || '').toString().trim();
+    var driverEmail = (byTitle['Driver email'] || '').toString().trim();
+
+    // These are required on the form, so if they are missing we skip safely.
+    if (!driverSurname || !driverEmail) {
+      return;
+    }
+
+    var rowValues = [
+      (byTitle['Driver first name'] || '').toString().trim(),
+      driverSurname,
+      (byTitle['Navigator first name'] || '').toString().trim(),
+      (byTitle['Navigator surname'] || '').toString().trim(),
+      (byTitle['Driver mobile number'] || '').toString().trim(),
+      driverEmail,
+      (byTitle['Car make/model'] || '').toString().trim(),
+      (byTitle['Car year'] || '').toString().trim(),
+      (byTitle['Speed group'] || '').toString().trim()
+    ];
+
+    // Find existing row by Driver surname + Driver email (columns 2 and 6).
+    var lastRow = sheet.getLastRow();
+    var targetRow = lastRow + 1;
+    var key = (driverSurname + '||' + driverEmail).toLowerCase();
+
+    if (lastRow >= 2) {
+      var dataRange = sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).getValues();
+      for (var r = 0; r < dataRange.length; r++) {
+        var existingSurname = (dataRange[r][1] || '').toString().trim();
+        var existingEmail = (dataRange[r][5] || '').toString().trim();
+        var rowKey = (existingSurname + '||' + existingEmail).toLowerCase();
+        if (rowKey === key) {
+          // Overwrite this row (last submission wins).
+          targetRow = r + 2;
+          break;
+        }
+      }
+    }
+
+    sheet.getRange(targetRow, 1, 1, rowValues.length).setValues([rowValues]);
+  } catch (err) {
+    logError_('handleEntrySubmit_', err);
+  }
+}
+
+
+/**
+ * Ensure a single onFormSubmit trigger for the entrant form.
+ */
+function ensureEntrySubmitTrigger_(entrantForm) {
+  try {
+    if (!entrantForm) return;
+    var triggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < triggers.length; i++) {
+      var t = triggers[i];
+      if (t.getHandlerFunction && t.getHandlerFunction() === 'handleEntrySubmit_') {
+        ScriptApp.deleteTrigger(t);
+      }
+    }
+    ScriptApp.newTrigger('handleEntrySubmit_')
+      .forForm(entrantForm)
+      .onFormSubmit()
+      .create();
+  } catch (err) {
+    logError_('ensureEntrySubmitTrigger_', err);
+  }
+}
+
+/**
+ * Handle STC Day 1 submissions (raw dump, no checks).
+ * This simply appends a row to the "STC Day 1" sheet using:
+ *   [Driver Surname, Rally Number, STC 1, STC 2, ...]
+ */
+
+// --- STC time parsing helpers -------------------------------------------------
+/**
+ * Parse a flexible STC time entry into a normalised HH:MM:SS string.
+ * Accepts separators (: . ,) or packed digits (MMSS, HMMSS, HHMMSS).
+ * Returns null if parsing fails.
+ */
+function parseStcTimeToHms_(raw) {
+  if (raw == null) return null;
+  var s = String(raw).trim();
+  if (!s) return null;
+
+  // If contains separators, normalise . and , to :
+  var hasSep = (s.indexOf(':') !== -1) || (s.indexOf('.') !== -1) || (s.indexOf(',') !== -1);
+  var parts, h = 0, m = 0, sec = 0;
+
+  if (hasSep) {
+    s = s.replace(/[.,]/g, ':');
+    parts = s.split(':');
+    if (parts.length === 1) {
+      // mm -> 00:mm:00
+      h = 0;
+      m = Number(parts[0]);
+      sec = 0;
+    } else if (parts.length === 2) {
+      // mm:ss -> 00:mm:ss
+      h = 0;
+      m = Number(parts[0]);
+      sec = Number(parts[1]);
+    } else if (parts.length === 3) {
+      h = Number(parts[0]);
+      m = Number(parts[1]);
+      sec = Number(parts[2]);
+    } else {
+      return null;
+    }
+  } else {
+    // Packed digits: allow 3–6 digits
+    if (!/^[0-9]+$/.test(s)) return null;
+    if (s.length < 3 || s.length > 6) return null;
+
+    if (s.length === 3) {
+      // MSS -> 00:0M:SS
+      h = 0;
+      m = Number(s.substr(0, 1));
+      sec = Number(s.substr(1, 2));
+    } else if (s.length === 4) {
+      // MMSS -> 00:MM:SS
+      h = 0;
+      m = Number(s.substr(0, 2));
+      sec = Number(s.substr(2, 2));
+    } else if (s.length === 5) {
+      // HMMSS -> H:MM:SS
+      h = Number(s.substr(0, 1));
+      m = Number(s.substr(1, 2));
+      sec = Number(s.substr(3, 2));
+    } else {
+      // 6 digits: HHMMSS
+      h = Number(s.substr(0, 2));
+      m = Number(s.substr(2, 2));
+      sec = Number(s.substr(4, 2));
+    }
+  }
+
+  if (!isFinite(h) || !isFinite(m) || !isFinite(sec)) return null;
+  if (h < 0 || h > 9) return null; // Rally spec: not greater than 9 hours
+  if (m < 0 || m > 59 || sec < 0 || sec > 59) return null;
+
+  // Format as HH:MM:SS
+  var hh = (h < 10 ? '0' + h : String(h));
+  var mm = (m < 10 ? '0' + m : String(m));
+  var ss = (sec < 10 ? '0' + sec : String(sec));
+  return hh + ':' + mm + ':' + ss;
+}
+
+// --- STC Day 1: onFormSubmit handler ----------------------------------------
+/**
+ * handleStcSubmit_Day1_
+ * Handler for STC Day 1 submissions.
+ * - Triggered only for the Day 1 STC form (ensureStcSubmitTriggerForDay1_)
+ * - Converts flexible time inputs to HH:MM:SS using parseStcTimeToHms_
+ * - Finds the entrant row by rally number + surname (case-insensitive)
+ *   and overwrites that row's STC columns (no new rows are added).
+ */
+function handleStcSubmit_Day1_(e) {
+  try {
+    var form = e && e.source;
+    if (!form || typeof form.getDestinationId !== 'function') return;
+
+    var destId = form.getDestinationId && form.getDestinationId();
+    if (!destId) return;
+
+    var ss = SpreadsheetApp.openById(destId);
+    var sheetName = 'STC Day 1';
+    var sheet = ss.getSheetByName(sheetName);
+    if (!sheet) {
+      // Skeleton sheets should already exist from uploadControls; if not, fail safely.
+      logError_('handleStcSubmit_Day1_', 'Missing sheet "' + sheetName + '" in destination spreadsheet');
+      return;
+    }
+
+    var itemResponses = (e && e.response && e.response.getItemResponses)
+      ? e.response.getItemResponses()
+      : [];
+    var byTitle = {};
+    for (var i = 0; i < itemResponses.length; i++) {
+      var ir = itemResponses[i];
+      var title = ir.getItem().getTitle();
+      byTitle[title] = ir.getResponse();
+    }
+
+    var rallyNumber = (byTitle['Rally Number'] || '').toString().trim();
+    var driverSurname = (byTitle['Driver Surname'] || '').toString().trim();
+
+    // Require both rally number and surname to be present.
+    if (!rallyNumber || !driverSurname) {
+      return;
+    }
+
+    // Collect STC fields in numeric order (STC 1, STC 2, ...) and normalise times.
+    var stcValues = [];
+    var rawStcValues = [];
+    var stcIndex = 1;
+    while (true) {
+      var key = 'STC ' + stcIndex;
+      if (!(key in byTitle)) break;
+      var rawVal = (byTitle[key] || '').toString().trim();
+      var normalised = parseStcTimeToHms_(rawVal);
+      rawStcValues.push(rawVal);
+      if (rawVal !== '' && normalised == null) {
+        logStcNoMatch_(ss, dayVal, rallyNumber, driverSurname, rawStcValues, 'INVALID_TIME_STC' + stcIndex);
+        return;
+      }
+      stcValues.push(normalised != null ? normalised : '');
+      stcIndex++;
+    }
+
+    if (stcValues.length === 0) {
+      // Nothing to write.
+      return;
+    }
+
+    // Find matching entrant row in STC Day 1 by rally number + surname (case-insensitive).
+    var surnameKey = driverSurname.toString().trim().toUpperCase();
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) {
+      // No entrant rows.
+      return;
+    }
+    var range = sheet.getRange(2, 1, lastRow - 1, 2); // Entrant, #
+    var values = range.getValues();
+    var targetRowIndex = -1; // 1-based row index in sheet
+
+    for (var r = 0; r < values.length; r++) {
+      var nameCell = (values[r][0] != null) ? String(values[r][0]).trim() : '';
+      var rallyCell = (values[r][1] != null) ? String(values[r][1]).trim() : '';
+      if (!rallyCell) continue;
+      if (rallyCell === rallyNumber && nameCell.toUpperCase() === surnameKey) {
+        targetRowIndex = 2 + r;
+        break;
+      }
+    }
+
+    if (targetRowIndex === -1) {
+      // No matching entrant for this rally number + surname; log to STC Errors and do not modify the main sheet.
+      logStcNoMatch_(ss, dayVal, rallyNumber, driverSurname, stcValues, 'NO_MATCH_RALLY_SURNAME');
+      return;
+    }
+
+    // Overwrite STC columns on the matched row. Columns 3..(2 + stcValues.length)
+    sheet.getRange(targetRowIndex, 3, 1, stcValues.length).setValues([stcValues]);
+  } catch (err) {
+    logError_('handleStcSubmit_Day1_', err);
+  }
+}
+
+/**
+ * Ensure a single onFormSubmit trigger for the STC Day 1 form.
+ */
+
+/**
+ * Log an STC submission that did not match any entrant row.
+ * Creates an "STC Errors" sheet on first use.
+ */
+
+/**
+ * Ensure the STC Errors sheet exists (with header) and return it.
+ */
+function ensureStcErrorsSheet_(ss) {
+  if (!ss) return null;
+  var sheet = ss.getSheetByName('STC Errors');
+  if (!sheet) sheet = ss.insertSheet('STC Errors');
+
+  // Ensure header row
+  if (sheet.getLastRow() < 1) {
+    sheet.getRange(1, 1, 1, 6).setValues([[
+      'Timestamp',
+      'Day',
+      'Rally Number',
+      'Surname',
+      'Reason',
+      'Raw STC Values'
+    ]]);
+  }
+
+  // Sheet presentation (requested)
+  try {
+    sheet.setFrozenRows(1);
+    // Col E (Reason) and Col F (Raw STC Values)
+    sheet.setColumnWidth(5, 286);
+    sheet.setColumnWidth(6, 900);
+  } catch (e) {
+    // Non-fatal formatting failure
+  }
+
+  return sheet;
+}
+
+function logStcNoMatch_(ss, dayVal, rallyNumber, driverSurname, stcValues, reason) {
+  try {
+    if (!ss) return;
+
+    var sheet = ensureStcErrorsSheet_(ss);
+    if (!sheet) return;
+
+    sheet.appendRow([
+      new Date(),
+      dayVal || '',
+      rallyNumber || '',
+      driverSurname || '',
+      reason || 'NO_MATCH_RALLY_SURNAME',
+      (stcValues || []).join(' | ')
+    ]);
+  } catch (err) {
+    logError_('logStcNoMatch_', err);
+  }
+}
+
+function ensureStcSubmitTriggerForDay1_(stcForm) {
+  try {
+    if (!stcForm) return;
+    var triggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < triggers.length; i++) {
+      var t = triggers[i];
+      if (t.getHandlerFunction && t.getHandlerFunction() === 'handleStcSubmit_Day1_') {
+        ScriptApp.deleteTrigger(t);
+      }
+    }
+    ScriptApp.newTrigger('handleStcSubmit_Day1_')
+      .forForm(stcForm)
+      .onFormSubmit()
+      .create();
+  } catch (err) {
+    logError_('ensureStcSubmitTriggerForDay1_', err);
+  }
+}
+
+
+// --- Marshal Day 1: onFormSubmit handler -------------------------------------
+/**
+ * handleMarshalSubmit_Day1_
+ * Minimal handler for Marshal Day 1 submissions.
+ * - Triggered only for the Day 1 Marshal form (ensureMarshalSubmitTriggerForDay1_)
+ * - No data manipulation yet: writes raw times into "Marshal Day 1".
+ *   Column A: Marshal Number; Columns B..: Car 1 Time, Car 2 Time, ...
+ */
+
+function handleMarshalSubmit_Day1_(e) {
+  try {
+    var form = e && e.source;
+    if (!form || typeof form.getDestinationId !== 'function') return;
+
+    var destId = form.getDestinationId && form.getDestinationId();
+    if (!destId) return;
+
+    var ss = SpreadsheetApp.openById(destId);
+    var sheetName = 'Marshal Day 1';
+    var sheet = ss.getSheetByName(sheetName);
+    if (!sheet) {
+      logError_('handleMarshalSubmit_Day1_', 'Missing sheet "' + sheetName + '" in destination spreadsheet');
+      return;
+    }
+
+    var itemResponses = (e && e.response && e.response.getItemResponses)
+      ? e.response.getItemResponses()
+      : [];
+    var byTitle = {};
+    for (var i = 0; i < itemResponses.length; i++) {
+      var ir = itemResponses[i];
+      var title = ir.getItem().getTitle();
+      byTitle[title] = ir.getResponse();
+    }
+
+    var marshalNumberRaw = (byTitle['Marshal Number'] || '').toString().trim();
+    if (!marshalNumberRaw) {
+      // No marshal identifier; nothing to map.
+      return;
+    }
+    var marshalColIndex = parseInt(marshalNumberRaw, 10);
+    if (!isFinite(marshalColIndex) || marshalColIndex <= 0) {
+      // Invalid marshal number.
+      return;
+    }
+    // Column 1 is '#', so Marshal 1 is column 2, Marshal 2 is column 3, etc.
+    var targetCol = 1 + marshalColIndex;
+
+    // Collect Car N Time fields in numeric order (Car 1 Time, Car 2 Time, ...)
+    // and normalise times using the same helper as STC.
+    var carTimes = [];
+    var carNo = 1;
+    while (true) {
+      var key = 'Car ' + carNo + ' Time';
+      if (!(key in byTitle)) break;
+      var rawVal = (byTitle[key] || '').toString().trim();
+      var normalised = parseStcTimeToHms_(rawVal);
+      carTimes.push(normalised != null ? normalised : rawVal);
+      carNo++;
+    }
+
+    if (carTimes.length === 0) {
+      // Nothing to write.
+      return;
+    }
+
+    // Ensure the '#' column has car numbers 1..N for the rows we are about to touch.
+    var numCars = carTimes.length;
+    var hashRange = sheet.getRange(2, 1, numCars, 1);
+    var hashValues = hashRange.getValues();
+    for (var r = 0; r < numCars; r++) {
+      var current = hashValues[r][0];
+      if (current === '' || current == null) {
+        hashValues[r][0] = r + 1; // Car number (1-based)
+      }
+    }
+    hashRange.setValues(hashValues);
+
+    // Write car times vertically into the Marshal N column, rows 2..(1+numCars).
+    var colRange = sheet.getRange(2, targetCol, numCars, 1);
+    var colValues = [];
+    for (var r2 = 0; r2 < numCars; r2++) {
+      colValues.push([carTimes[r2] || '']);
+    }
+    colRange.setValues(colValues);
+  } catch (err) {
+    logError_('handleMarshalSubmit_Day1_', err);
+  }
+}
+
+/**
+ * Ensure a single onFormSubmit trigger for the Marshal Day 1 form.
+ */
+function ensureMarshalSubmitTriggerForDay1_(marshalForm) {
+  try {
+    if (!marshalForm) return;
+    var triggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < triggers.length; i++) {
+      var t = triggers[i];
+      if (t.getHandlerFunction && t.getHandlerFunction() === 'handleMarshalSubmit_Day1_') {
+        ScriptApp.deleteTrigger(t);
+      }
+    }
+    ScriptApp.newTrigger('handleMarshalSubmit_Day1_')
+      .forForm(marshalForm)
+      .onFormSubmit()
+      .create();
+  } catch (err) {
+    logError_('ensureMarshalSubmitTriggerForDay1_', err);
+  }
+}
+
+function ensureFormSubmitTriggerForForm_(form, handlerName) {
+  try {
+    if (!form) return;
+    var formId = (typeof form.getId === 'function') ? form.getId() : null;
+    var triggers = ScriptApp.getProjectTriggers();
+
+
+    // v2.71: hard de-dupe by handler for key submit handlers only.
+    // When forms are rebuilt, formId changes and old triggers can linger; this prevents duplicates.
+    if (handlerName === 'handleStcSubmit_AllDays_' || handlerName === 'handleMarshalSubmit_AllDays_' || handlerName === 'handleEntrySubmit') {
+      for (var j = 0; j < triggers.length; j++) {
+        var tj = triggers[j];
+        var h = '';
+        try {
+          h = (typeof tj.getHandlerFunction === 'function') ? tj.getHandlerFunction() : '';
+        } catch (e0) {
+          h = '';
+        }
+        if (h === handlerName) {
+          ScriptApp.deleteTrigger(tj);
+        }
+      }
+      // Refresh triggers list after deletions
+      triggers = ScriptApp.getProjectTriggers();
+    }
+
+
+    // CLEANUP: ensure exactly ONE onFormSubmit trigger exists for this form source,
+    // regardless of handler function name (prevents yesterday's duplicate-trigger experiments
+    // from biting us today).
+    for (var i = 0; i < triggers.length; i++) {
+      var t = triggers[i];
+      var sameSource = false;
+      try {
+        sameSource = (typeof t.getTriggerSourceId === 'function') && formId && (t.getTriggerSourceId() === formId);
+      } catch (e) {
+        sameSource = false;
+      }
+
+      var isFormSubmit = false;
+      try {
+        isFormSubmit = (typeof t.getEventType === 'function') && (t.getEventType() === ScriptApp.EventType.ON_FORM_SUBMIT);
+      } catch (e2) {
+        // If we can't read event type, leave it alone unless it matches source AND handler.
+        isFormSubmit = false;
+      }
+
+      var sameHandler = false;
+      try {
+        sameHandler = (typeof t.getHandlerFunction === 'function') && (t.getHandlerFunction() === handlerName);
+      } catch (e3) {
+        sameHandler = false;
+      }
+
+      if (sameSource && (isFormSubmit || sameHandler)) {
+        ScriptApp.deleteTrigger(t);
+      }
+    }
+
+    ScriptApp.newTrigger(handlerName)
+      .forForm(form)
+      .onFormSubmit()
+      .create();
+  } catch (err) {
+    logError_('ensureFormSubmitTriggerForForm_', err);
+  }
+}
+
+
+function parseDayFromFormTitle_(title) {
+  var m = /\bDay\s+(\d+)\b/i.exec(title || '');
+  return m ? String(m[1]) : '';
+}
+
+function parseRallyNameFromFormTitle_(title) {
+  // Support both rally-first and rally-last naming, and both dash styles.
+  // Examples we accept:
+  //   "<Rally Title> – STC Times – Day X"
+  //   "<Rally Title> – STC – Day X"
+  //   "STC – Day X – <Rally Title>"
+  //   "<Rally Title> – Marshal – Day X"
+  //   "Marshal – Day X – <Rally Title>"
+  //
+  // NOTE: We return the rally title segment only (trimmed). If no pattern matches,
+  // we fall back to the previous heuristic.
+
+  var t = String(title || '').trim();
+  if (!t) return '';
+
+  // Normalise common dash variants for parsing (keeps original string intact).
+  var tn = t.replace(/\s-\s/g, ' – ');
+
+  // 1) Rally-first STC Times
+  var m = tn.match(/^(.*?)\s–\sSTC\sTimes\s–\sDay\s(\d+)\b/i);
+  if (m && m[1]) return String(m[1]).trim();
+
+  // 2) Rally-first STC
+  m = tn.match(/^(.*?)\s–\sSTC\s–\sDay\s(\d+)\b/i);
+  if (m && m[1]) return String(m[1]).trim();
+
+  // 3) STC-first
+  m = tn.match(/^STC(?:\sTimes)?\s–\sDay\s(\d+)\s–\s(.+)$/i);
+  if (m && m[2]) return String(m[2]).trim();
+
+  // 4) Rally-first Marshal
+  m = tn.match(/^(.*?)\s–\sMarshal\s–\sDay\s(\d+)\b/i);
+  if (m && m[1]) return String(m[1]).trim();
+
+  // 5) Marshal-first
+  m = tn.match(/^Marshal\s–\sDay\s(\d+)\s–\s(.+)$/i);
+  if (m && m[2]) return String(m[2]).trim();
+
+  // Fallback: take everything before the last " – Day " (or " - Day ")
+  var j = tn.lastIndexOf(' – Day ');
+  if (j > 0) return tn.substring(0, j).trim();
+
+  // Last resort (keeps legacy behaviour)
+  return t;
+}
+
+
+function findFirstControlsSpreadsheetInFolder_(folder) {
+  try {
+    // Prefer files whose name starts with "Rally Controls"
+    var files = folder.getFilesByType(MimeType.GOOGLE_SHEETS);
+    var fallbackId = null;
+
+    while (files.hasNext()) {
+      var f = files.next();
+      var name = (f.getName && f.getName()) ? f.getName() : '';
+      if (!fallbackId) fallbackId = f.getId();
+      if (/^Rally\s+Controls/i.test(name)) {
+        return SpreadsheetApp.openById(f.getId());
+      }
+    }
+    return fallbackId ? SpreadsheetApp.openById(fallbackId) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+
+
+/**
+ * Watermark helper: derive rallyName from a rallyFolderId.
+ * Folder is expected to be named like: "Rally – <Rally Name>".
+ * Falls back to the full folder name if it doesn't match the pattern.
+ */
+function deriveRallyNameFromFolderId_(rallyFolderId) {
+  try {
+    if (!rallyFolderId) return '';
+    var folder = DriveApp.getFolderById(rallyFolderId);
+    var name = folder && folder.getName ? String(folder.getName()) : '';
+    name = name ? name.trim() : '';
+    if (!name) return '';
+    var m = /^Rally\s*[–-]\s*(.+)$/.exec(name);
+    return (m && m[1]) ? String(m[1]).trim() : name;
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * Best-effort fallback: open the rally controls spreadsheet by scanning the rally folder.
+ * Used only for logging errors when rallyName cannot be resolved.
+ */
+function openControlsSpreadsheetFromRallyFolderId_(rallyFolderId) {
+  try {
+    if (!rallyFolderId) return null;
+    var folder = DriveApp.getFolderById(rallyFolderId);
+    if (!folder) return null;
+    var files = folder.getFilesByType(MimeType.GOOGLE_SHEETS);
+    var best = null;
+    while (files.hasNext()) {
+      var f = files.next();
+      var nm = f.getName ? String(f.getName()) : '';
+      if (!best) best = f;
+      if (nm && nm.indexOf('Rally Controls') === 0) {
+        best = f;
+        break;
+      }
+    }
+    return best ? SpreadsheetApp.openById(best.getId()) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+
+function handleStcSubmit_AllDays_(e) {
+  try {
+    var form = e && e.source;
+    if (!form || typeof form.getTitle !== 'function') return;
+
+    var tag = getFormTag_(form.getId());
+    if (!tag || !tag.kind || String(tag.kind) !== 'STC') {
+      // STC trigger should only be attached to STC forms; do nothing if not.
+      return;
+    }
+
+    // Watermark-first: do NOT rely on the visible form title for routing.
+    var dayVal = tag.day ? Number(tag.day) : null;
+    var rallyFolderId = tag.rallyFolderId ? String(tag.rallyFolderId) : '';
+    var rallyName = tag.rallyName ? String(tag.rallyName) : '';
+
+    if (!rallyName && rallyFolderId) {
+      rallyName = deriveRallyNameFromFolderId_(rallyFolderId);
+    }
+
+    // If we still cannot resolve the rally context, log to STC Errors if possible (no silent exits).
+    if (!dayVal || !rallyName) {
+      var ssFallback = rallyFolderId ? openControlsSpreadsheetFromRallyFolderId_(rallyFolderId) : null;
+      if (ssFallback) {
+        logStcNoMatch_(ssFallback, dayVal || '', '', '', [], 'MISSING_WATERMARK_FIELDS');
+      }
+      return;
+    }
+
+    var storage = ensureRallyStorage_(rallyName);
+    var ss = storage && storage.spreadsheet;
+    if (!ss) return;
+
+    var sheetName = 'STC Day ' + dayVal;
+    var sheet = ss.getSheetByName(sheetName);
+    if (!sheet) {
+      logError_('handleStcSubmit_AllDays_', 'Missing sheet "' + sheetName + '" in rally spreadsheet');
+      return;
+    }
+
+    var itemResponses = (e && e.response && e.response.getItemResponses)
+      ? e.response.getItemResponses()
+      : [];
+    var byTitle = {};
+    for (var i = 0; i < itemResponses.length; i++) {
+      var ir = itemResponses[i];
+      var it = ir.getItem && ir.getItem();
+      var t = it && it.getTitle ? it.getTitle() : '';
+      byTitle[t] = ir.getResponse();
+    }
+
+    var rallyNumber = (byTitle['Rally Number'] || '').toString().trim();
+
+    // Surname is required. Prefer the explicit "Driver Surname" field, but allow common aliases.
+    var driverSurname = (byTitle['Driver Surname'] || byTitle['Entrant'] || byTitle['Surname'] || '').toString().trim();
+
+    if (!rallyNumber || !driverSurname) {
+      logStcNoMatch_(ss, dayVal, rallyNumber || '', driverSurname || '', [], 'MISSING_KEYS');
+      return;
+    }
+
+    var stcValues = [];
+    var rawStcValues = [];
+
+    var stcIndex = 1;
+    while (true) {
+      // Support both current and legacy STC field titles.
+      var keyA = 'STC ' + stcIndex;            // current form titles
+      var keyB = 'STC ' + stcIndex + ' Time';  // legacy form titles
+      if (!(keyA in byTitle) && !(keyB in byTitle)) break;
+      var rawVal = '';
+      if (keyA in byTitle && byTitle[keyA] != null && String(byTitle[keyA]).trim() !== '') {
+        rawVal = String(byTitle[keyA]).trim();
+      } else {
+        rawVal = (byTitle[keyB] || '').toString().trim();
+      }
+      var normalised = parseStcTimeToHms_(rawVal);
+      rawStcValues.push(rawVal);
+      if (rawVal !== '' && normalised == null) {
+        logStcNoMatch_(ss, dayVal, rallyNumber, driverSurname, rawStcValues, 'INVALID_TIME_STC' + stcIndex);
+        return;
+      }
+      stcValues.push(normalised != null ? normalised : '');
+      stcIndex++;
+    }
+
+    if (stcValues.length === 0) return;
+
+    var surnameKey = driverSurname.toString().trim().toUpperCase();
+    var lastRow = sheet.getLastRow();
+    if (lastRow < 2) return;
+
+    var range = sheet.getRange(2, 1, lastRow - 1, 2); // Entrant, #
+    var values = range.getValues();
+    var targetRowIndex = -1;
+    for (var r = 0; r < values.length; r++) {
+      var nameCell = (values[r][0] != null) ? String(values[r][0]).trim() : '';
+      var rallyCell = (values[r][1] != null) ? String(values[r][1]).trim() : '';
+      if (!rallyCell) continue;
+      if (rallyCell === rallyNumber && nameCell.toUpperCase() === surnameKey) {
+        targetRowIndex = 2 + r;
+        break;
+      }
+    }
+
+    if (targetRowIndex === -1) {
+      logStcNoMatch_(ss, dayVal, rallyNumber, driverSurname, stcValues, 'NO_MATCH_RALLY_SURNAME');
+      return;
+    }
+
+    sheet.getRange(targetRowIndex, 3, 1, stcValues.length).setValues([stcValues]);
+  } catch (err) {
+    logError_('handleStcSubmit_AllDays_', err);
+  }
+}
+
+function handleMarshalSubmit_AllDays_(e) {
+  try {
+    var form = e && e.source;
+    if (!form || typeof form.getTitle !== 'function') return;
+
+    var title = form.getTitle();
+    var tag = getFormTag_(form.getId());
+    if (tag && tag.kind && String(tag.kind) !== 'MARSHAL') tag = null;
+    var dayVal = (tag && tag.day) ? Number(tag.day) : parseDayFromFormTitle_(title);
+    var rallyName = (tag && tag.rallyName) ? String(tag.rallyName) : parseRallyNameFromFormTitle_(title);
+    if (!dayVal || !rallyName) return;
+
+    var storage = ensureRallyStorage_(rallyName);
+    var ss = storage && storage.spreadsheet;
+    if (!ss) return;
+
+    var sheetName = 'Marshal Day ' + dayVal;
+    var sheet = ss.getSheetByName(sheetName);
+    if (!sheet) {
+      logError_('handleMarshalSubmit_AllDays_', 'Missing sheet "' + sheetName + '" in rally spreadsheet');
+      return;
+    }
+
+    var itemResponses = (e && e.response && e.response.getItemResponses)
+      ? e.response.getItemResponses()
+      : [];
+    var byTitle = {};
+    for (var i = 0; i < itemResponses.length; i++) {
+      var ir = itemResponses[i];
+      var it = ir.getItem && ir.getItem();
+      var t = it && it.getTitle ? it.getTitle() : '';
+      byTitle[t] = ir.getResponse();
+    }
+
+    var marshalNumberRaw = (byTitle['Marshal Number'] || '').toString().trim();
+    if (!marshalNumberRaw) return;
+    var marshalColIndex = parseInt(marshalNumberRaw, 10);
+    if (!isFinite(marshalColIndex) || marshalColIndex <= 0) return;
+    var targetCol = 1 + marshalColIndex;
+
+    var carTimes = [];
+    var carNo = 1;
+    while (true) {
+      var key = 'Car ' + carNo + ' Time';
+      if (!(key in byTitle)) break;
+      var rawVal = (byTitle[key] || '').toString().trim();
+      var normalised = parseStcTimeToHms_(rawVal);
+      carTimes.push(normalised != null ? normalised : rawVal);
+      carNo++;
+    }
+
+    if (carTimes.length === 0) return;
+
+    var numCars = carTimes.length;
+    var hashRange = sheet.getRange(2, 1, numCars, 1);
+    var hashValues = hashRange.getValues();
+    for (var r = 0; r < numCars; r++) {
+      var current = hashValues[r][0];
+      if (current === '' || current == null) {
+        hashValues[r][0] = r + 1;
+      }
+    }
+    hashRange.setValues(hashValues);
+
+    var colRange = sheet.getRange(2, targetCol, numCars, 1);
+    var colValues = [];
+    for (var r2 = 0; r2 < numCars; r2++) {
+      colValues.push([carTimes[r2] || '']);
+    }
+    colRange.setValues(colValues);
+  } catch (err) {
+    logError_('handleMarshalSubmit_AllDays_', err);
+  }
+}
+
+
+
+
+
+function downloadEntries_(rallyName) {
+  try {
+    var name = rallyName || 'Rally';
+    var storageForAdmin = ensureRallyStorage_(name);
+    var ssAdmin = storageForAdmin.spreadsheet;
+    var entriesSheetName = 'Admin - Entries';
+    var sh = ssAdmin.getSheetByName(entriesSheetName);
+    if (!sh) {
+      return { ok:false, error:'Admin - Entries sheet not found' };
+    }
+    var values = sh.getDataRange().getDisplayValues();
+    if (!values || values.length <= 1) {
+      return { ok:true, rows: [] };
+    }
+    var rows = values.slice(1);
+    // Prepend Entry number so the Admin page table aligns (Entry, then fields).
+    rows = rows.map(function(r, i){ return [String(i+1)].concat(r); });
+    return { ok:true, rows: rows };
+  } catch (e) {
+    return { ok:false, error:String(e) };
+  }
+}
+
+
+
+
+/**
+ * Status helper for Admin entries presence.
+ * Returns whether an "Admin - Entries" sheet exists for the rally.
+ */
+function adminStatus_(rallyName) {
+  try {
+    var name = rallyName || 'Rally';
+    var slug = slugRallyName_(name);
+    var props = getProps_();
+
+    // READ-ONLY: never create folders, sheets, forms, or destinations from status.
+    var ss = null;
+    var ssIdKey = PROP_PREFIX + 'spreadsheetId_' + slug;
+    var ssId = props.getProperty(ssIdKey);
+
+    if (ssId) {
+      try { ss = SpreadsheetApp.openById(ssId); } catch (_) { ss = null; }
+    }
+
+    // Fallback (read-only): locate by name without creating base folders.
+    if (!ss) {
+      var ssNameBase = 'Rally Controls – ' + name;
+      var ssNameVariants = nameVariants_(ssNameBase);
+      for (var i = 0; i < ssNameVariants.length && !ss; i++) {
+        var it = DriveApp.getFilesByName(ssNameVariants[i]);
+        if (it && it.hasNext()) {
+          try { ss = SpreadsheetApp.openById(it.next().getId()); } catch (_) {}
+        }
+      }
+    }
+
+    if (!ss) {
+      return {
+        ok: true,
+        rallyName: name,
+        spreadsheetUrl: '',
+        entriesSheetUrl: '',
+        responsesSheetUrl: '',
+        entryFormUrl: '',
+        hasAdminEntries: false,
+        hasAdminEntriesRows: false
+      };
+    }
+
+    var spreadsheetUrl = ss.getUrl();
+
+    // Admin - Entries sheet URL + has rows
+    var entriesSheetName = 'Admin - Entries';
+    var entriesSheetUrl = '';
+    var hasAdminEntries = false;
+    var hasAdminEntriesRows = false;
+
+    try {
+      var sh = ss.getSheetByName(entriesSheetName);
+      if (sh) {
+        hasAdminEntries = true;
+        entriesSheetUrl = spreadsheetUrl + '#gid=' + sh.getSheetId();
+        var lastRow = sh.getLastRow();
+        hasAdminEntriesRows = (lastRow && lastRow > 1);
+      }
+    } catch (_) {}
+
+    // Entry form URL (read-only: from stored id if available)
+    var entryFormUrl = '';
+    try {
+      var entriesFormIdKey = PROP_PREFIX + 'entriesFormId_' + slug;
+      var formId = props.getProperty(entriesFormIdKey);
+      if (formId) {
+        entryFormUrl = FormApp.openById(formId).getPublishedUrl();
+      }
+    } catch (_) {}
+
+    // Entries responses spreadsheet URL (prefer persisted destination id)
+    var responsesSheetUrl = '';
+    try {
+      var respId = '';
+      // New key (future-proof)
+      var entriesDestKey = PROP_PREFIX + 'entriesResponsesSsId_' + slug;
+      respId = props.getProperty(entriesDestKey) || '';
+
+      // Back-compat: key used by uploadEntries_ (v2.64+)
+      if (!respId) {
+        var legacyKey = 'ENTRIES_RESP_SSID__' + slug;
+        respId = props.getProperty(legacyKey) || '';
+      }
+
+      if (respId) {
+        responsesSheetUrl = SpreadsheetApp.openById(respId).getUrl();
+      }
+    } catch (_) {}
+
+    return {
+      ok: true,
+      rallyName: name,
+      spreadsheetUrl: spreadsheetUrl,
+      entriesSheetUrl: entriesSheetUrl,
+      responsesSheetUrl: responsesSheetUrl,
+      entryFormUrl: entryFormUrl,
+      hasAdminEntries: hasAdminEntries,
+      hasAdminEntriesRows: hasAdminEntriesRows
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+
+/**
+ * Status helper for Controls / forms presence.
+ *
+ * IMPORTANT:
+ * - Read-only: must not create new Drive files/folders or sheets.
+ * - Day-scoped: all fields reflect ONLY the requested day.
+ *
+ * Returns (for selected day n):
+ *  - hasControlsData (day-only)
+ *  - entrantFormUrl (STC form URL for day)
+ *  - marshalFormUrl (Marshal form URL for day)
+ *  - responsesFolderId OR responsesFolderUrl (best-effort)
+ */
+function controlsStatus_(rallyName, day) {
+  try {
+    var name = rallyName || 'Rally';
+    var dayVal = String(day || '1');
+
+    // Spreadsheet must already exist; do not create anything here.
+    var ss = findRallySpreadsheet_(name);
+    if (!ss) {
+      return {
+        ok: true,
+        rallyName: name,
+        day: dayVal,
+        spreadsheetUrl: '',
+        hasControlsData: false,
+        entrantFormUrl: '',
+        marshalFormUrl: '',
+        responsesFolderId: '',
+        responsesFolderUrl: '',
+        responsesRootFolderId: '',
+        responsesRootFolderUrl: ''
+      };
+    }
+
+    // Day-scoped controls data: presence of the specific day sheets.
+    var hasControlsData = !!(ss.getSheetByName('STC Day ' + dayVal) || ss.getSheetByName('Marshal Day ' + dayVal));
+
+    // Best-effort: find the rally folder without creating duplicates.
+    var rallyFolder = findRallyFolder_(name);
+
+    // Day-scoped form URLs (read-only).
+    var urls = resolveDayFormUrls_(rallyFolder, name, dayVal);
+
+    // Best-effort: response folder for this day (prefer response sheets' parent folder).
+    var respFolder = resolveResponsesFolderForDay_(rallyFolder, name, dayVal);
+
+    // Non-day-based: parent folder above the per-day responses folder (best-effort).
+    // This is the folder you can open to see all response forms/sheets for the rally.
+    var respRoot = { responsesRootFolderId: '', responsesRootFolderUrl: '' };
+    try {
+      if (respFolder && respFolder.responsesFolderId) {
+        var f = DriveApp.getFolderById(respFolder.responsesFolderId);
+        respRoot.responsesRootFolderId = f.getId();
+          respRoot.responsesRootFolderUrl = f.getUrl();
+      }
+    } catch (eRoot) {}
+    try {
+      if (!respRoot.responsesRootFolderId && rallyFolder) {
+        respRoot.responsesRootFolderId = rallyFolder.getId();
+        respRoot.responsesRootFolderUrl = rallyFolder.getUrl();
+      }
+    } catch (eRoot2) {}
+
+
+
+    // Non-day-based: parent folder above the per-day responses folder (best-effort).
+    var respRoot = { responsesRootFolderId: '', responsesRootFolderUrl: '' };
+    try {
+      if (respFolder && respFolder.responsesFolderId) {
+        var f = DriveApp.getFolderById(respFolder.responsesFolderId);
+        respRoot.responsesRootFolderId = f.getId();
+          respRoot.responsesRootFolderUrl = f.getUrl();
+      }
+    } catch (eRoot) {}
+    try {
+      if (!respRoot.responsesRootFolderId && rallyFolder) {
+        respRoot.responsesRootFolderId = rallyFolder.getId();
+        respRoot.responsesRootFolderUrl = rallyFolder.getUrl();
+      }
+    } catch (eRoot2) {}
+
+    // Fallback: if we couldn't get a parent, use the rally folder itself.
+    try {
+      if ((!respRoot.responsesRootFolderId || !respRoot.responsesRootFolderUrl) && rallyFolder) {
+        respRoot.responsesRootFolderId = rallyFolder.getId();
+        respRoot.responsesRootFolderUrl = rallyFolder.getUrl();
+      }
+    } catch (eRoot2) {}
+
+
+    return {
+      ok: true,
+      rallyName: name,
+      day: dayVal,
+      spreadsheetUrl: ss.getUrl(),
+      hasControlsData: hasControlsData,
+      entrantFormUrl: urls.entrantFormUrl || '',
+      marshalFormUrl: urls.marshalFormUrl || '',
+      responsesFolderId: respFolder.responsesFolderId || '',
+      responsesFolderUrl: respFolder.responsesFolderUrl || '',
+      responsesRootFolderId: respRoot.responsesRootFolderId || '',
+      responsesRootFolderUrl: respRoot.responsesRootFolderUrl || ''
+    };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
+/**
+ * Read-only lookup for an existing rally folder.
+ * Does NOT create folders.
+ */
+function findRallyFolder_(rallyName) {
+  var safeName = rallyName || 'Rally';
+  var slug = slugRallyName_(safeName);
+  var props = getProps_();
+
+  var baseFolder = ensureBaseFolder_(); // may create the base folder once if missing
+  var rallyFolderNameBase = 'Rally – ' + safeName;
+  var rallyFolderNameVariants = nameVariants_(rallyFolderNameBase);
+  var rallyFolderIdKey = PROP_PREFIX + 'rallyFolderId_' + slug;
+  var rallyFolderId = props.getProperty(rallyFolderIdKey);
+
+  if (rallyFolderId) {
+    try {
+      return DriveApp.getFolderById(rallyFolderId);
+    } catch (e) {
+      // fall through
+    }
+  }
+
+  for (var i = 0; i < rallyFolderNameVariants.length; i++) {
+    try {
+      var it = baseFolder.getFoldersByName(rallyFolderNameVariants[i]);
+      if (it.hasNext()) {
+        var f = it.next();
+        props.setProperty(rallyFolderIdKey, f.getId());
+        return f;
+      }
+    } catch (e2) {
+      // ignore and continue
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Resolve per-day STC/Marshal form URLs without creating forms.
+ * Uses the same naming convention as initForms_ / buildFormsForControls_.
+ */
+function resolveDayFormUrls_(rallyFolder, rallyName, dayVal) {
+  var out = { entrantFormUrl: '', marshalFormUrl: '' };
+  if (!rallyFolder) return out;
+
+  var stcDriveNameBase = 'STC – Day ' + dayVal + ' – ' + rallyName;
+  var marshalDriveNameBase = 'Marshals – Day ' + dayVal + ' – ' + rallyName;
+  var stcNames = nameVariants_(stcDriveNameBase);
+  var marshalNames = nameVariants_(marshalDriveNameBase);
+
+  try {
+    var stcFile = firstFileByNameVariants_(rallyFolder, stcNames);
+    if (stcFile) {
+      out.entrantFormUrl = FormApp.openById(stcFile.getId()).getPublishedUrl();
+    }
+  } catch (eStc) {}
+
+  try {
+    var marshalFile = firstFileByNameVariants_(rallyFolder, marshalNames);
+    if (marshalFile) {
+      out.marshalFormUrl = FormApp.openById(marshalFile.getId()).getPublishedUrl();
+    }
+  } catch (eM) {}
+
+  return out;
+}
+
+/**
+ * Resolve a folder to open for "View Response forms" for a given day.
+ *
+ * Best-effort rules:
+ *  1) Prefer the parent folder of the STC/Mashal response spreadsheets for that day (if found).
+ *  2) Otherwise, fall back to the parent folder of the STC form for that day (if found).
+ *  3) Otherwise, fall back to the rally folder itself (if known).
+ *
+ * Returns both id and url; callers can use either.
+ */
+function resolveResponsesFolderForDay_(rallyFolder, rallyName, dayVal) {
+  var out = { responsesFolderId: '', responsesFolderUrl: '' };
+
+  function setFolder_(folder) {
+    if (!folder) return;
+    out.responsesFolderId = folder.getId();
+    out.responsesFolderUrl = 'https://drive.google.com/drive/folders/' + folder.getId();
+  }
+
+  if (!rallyFolder) return out;
+
+  // 1) Response spreadsheets (created by ensureFormHasResponseSheet_)
+  var respNameBases = [
+    'STC Responses – Day ' + dayVal + ' – ' + rallyName,
+    'Marshal Responses – Day ' + dayVal + ' – ' + rallyName
+  ];
+
+  for (var i = 0; i < respNameBases.length; i++) {
+    try {
+      var f = firstFileByNameVariants_(rallyFolder, nameVariants_(respNameBases[i]));
+      if (f) {
+        var parents = f.getParents();
+        if (parents.hasNext()) {
+          setFolder_(parents.next());
+          return out;
+        }
+      }
+    } catch (e1) {}
+  }
+
+  // 2) Parent folder of the STC form (if present)
+  try {
+    var stcDriveNameBase = 'STC – Day ' + dayVal + ' – ' + rallyName;
+    var stcFile = firstFileByNameVariants_(rallyFolder, nameVariants_(stcDriveNameBase));
+    if (stcFile) {
+      var stcParents = stcFile.getParents();
+      if (stcParents.hasNext()) {
+        setFolder_(stcParents.next());
+        return out;
+      }
+    }
+  } catch (e2) {}
+
+  // 3) Rally folder fallback
+  setFolder_(rallyFolder);
+  return out;
+}
